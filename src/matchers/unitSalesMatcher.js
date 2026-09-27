@@ -1,4 +1,4 @@
-const { normalizeText } = require('./keywordMatcher');
+const { normalizeText } = require('../utils/textNormalizer');
 
 /**
  * Patterns that indicate unit sales inquiry (especially second-hand / stock / negotiation)

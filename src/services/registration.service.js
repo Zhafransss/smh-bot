@@ -20,11 +20,44 @@ function isRegistrationForm(text) {
   const lower = text.toLowerCase();
   
   // Must match at least "atas nama" and "alamat" or "kendala"
-  const hasName = lower.includes('atas nama') || lower.includes('nama:');
+  const hasName = lower.includes('atas nama') || /\bnama\s*[:=]/.test(lower);
   const hasAddress = lower.includes('alamat') || lower.includes('alamat:');
   const hasProblem = lower.includes('kendala') || lower.includes('kendala:') || lower.includes('keluhan:');
 
   return (hasName && hasAddress) || (hasName && hasProblem);
+}
+
+// Marker injected by whatsapp.service when the customer actually sends an image.
+// This is the ONLY reliable signal that a photo exists — typed text never counts as a photo.
+const PHOTO_MARKER = '[FOTO_UNIT]';
+
+/**
+ * Check whether the (aggregated) message contains a real image attachment
+ * @param {string} text
+ * @returns {boolean}
+ */
+function hasPhotoAttachment(text) {
+  return typeof text === 'string' && text.includes(PHOTO_MARKER);
+}
+
+/**
+ * Map a free-form label (e.g. "Alamat Lengkap & Patokan", "Kendala yang Dialami")
+ * to a registration field. The bot sends several template variants (Layer A,
+ * Layer B home service, outside-hours), so labels are matched by keyword, not exact text.
+ * Order matters: "Jenis Kendaraan" must not fall into "nama", etc.
+ * @param {string} label
+ * @returns {string|null} field key, or null if the label is not recognized
+ */
+function resolveFormField(label) {
+  const l = label.toLowerCase();
+  if (l.includes('alamat')) return 'alamat';
+  if (l.includes('foto')) return 'fotoUnit';
+  if (l.includes('kendala') || l.includes('keluhan')) return 'kendala';
+  if (l.includes('kendaraan') || l.includes('merk')) return 'kendaraan';
+  if (/\b(whatsapp|wa|hp|telp|telepon)\b/.test(l)) return 'noWhatsapp';
+  if (/\b(hari|jam|jadwal|kunjungan)\b/.test(l)) return 'rencanaJadwal';
+  if (/\bnama\b/.test(l)) return 'nama';
+  return null;
 }
 
 /**
@@ -35,54 +68,37 @@ function isRegistrationForm(text) {
 function parseRegistrationForm(text) {
   if (!text) return {};
 
-  const lines = text.split('\n');
   const result = {
     nama: '',
     alamat: '',
     fotoUnit: '',
     kendala: '',
-    hasPhoto: false,
+    kendaraan: '',
+    noWhatsapp: '',
+    rencanaJadwal: '',
+    hasPhoto: hasPhotoAttachment(text),
   };
 
+  // Photo marker may sit on its own line (aggregated image message) — never treat it as field content
+  const lines = text.split(PHOTO_MARKER).join('\n').split('\n');
   let currentKey = null;
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
     if (!line) continue;
 
-    // Pattern matching: - Atas nama: Budi or Atas nama : Budi
-    const match = line.match(/^[-*•]?\s*(atas\s+nama|nama|alamat|foto\s*(?:unit)?|kendala|keluhan)\s*[:=]\s*(.*)$/i);
+    // "- Atas nama: Budi", "• Alamat Lengkap & Patokan: Jl. ...", "Kendala yang Dialami = mati total"
+    const match = line.match(/^[-*•]?\s*([^:=]{1,60}?)\s*[:=]\s*(.*)$/);
+    // Template labels never contain digits; "sejak kemarin jam 10:00" is a continuation, not a label
+    const field = match && !/\d/.test(match[1]) ? resolveFormField(match[1]) : null;
 
-    if (match) {
-      const field = match[1].toLowerCase().replace(/\s+/g, '');
-      const value = match[2].trim();
-
-      if (field.includes('nama')) {
-        currentKey = 'nama';
-        result.nama = value;
-      } else if (field.includes('alamat')) {
-        currentKey = 'alamat';
-        result.alamat = value;
-      } else if (field.includes('foto')) {
-        currentKey = 'fotoUnit';
-        result.fotoUnit = value;
-        if (value && !['-', '--', 'belum', 'nanti', 'tidak ada', 'tdk ada'].includes(value.toLowerCase())) {
-          result.hasPhoto = true;
-        }
-      } else if (field.includes('kendala') || field.includes('keluhan')) {
-        currentKey = 'kendala';
-        result.kendala = value;
-      }
+    if (field) {
+      currentKey = field;
+      result[field] = match[2].trim();
     } else if (currentKey) {
-      // Continuation of previous multi-line value
+      // Continuation of previous multi-line value (also covers values containing ':' like "jam 10:00")
       result[currentKey] += ` ${line}`;
     }
-  }
-
-  // Check if message itself contained an attached photo marker [FOTO_UNIT]
-  if (text.includes('[FOTO_UNIT]')) {
-    result.hasPhoto = true;
-    if (!result.fotoUnit) result.fotoUnit = '[FOTO_UNIT TERLAMPIR]';
   }
 
   return result;
@@ -172,59 +188,44 @@ async function clearRegistration(phoneNumber) {
 }
 
 /**
- * Structure standardized API Request Body for external endpoint dispatch
- * @param {object} regData
- * @returns {object}
+ * Build the form fields for POST /api/home-service (website PublicServiceController@storeHomeService).
+ * The photo file (`gambar`) is attached separately by website.service.
+ * @param {object} regData - completed registration draft
+ * @returns {Record<string, string>}
  */
-function buildApiRequestBody(regData) {
-  return {
-    customer_phone: regData.phoneNumber,
-    customer_name: regData.nama || '',
-    service_type: regData.serviceType || 'home_service_or_workshop',
-    address: regData.alamat || '',
-    problem_description: regData.kendala || '',
-    unit_photo: {
-      has_photo: !!regData.hasPhoto,
-      media_info: regData.fotoUnit || (regData.hasPhoto ? '[FOTO_UNIT]' : null),
-    },
-    location: {
-      latitude: regData.location?.latitude || null,
-      longitude: regData.location?.longitude || null,
-      label: regData.location?.label || null,
-      raw: regData.location?.raw || null,
-    },
-    status: 'pending_verification',
-    registered_at: regData.registeredAt || new Date().toISOString(),
-  };
-}
-
-/**
- * Stub function to dispatch registration data to external API endpoint
- * @param {object} payload
- * @returns {Promise<object>}
- */
-async function dispatchRegistrationToEndpoint(payload) {
-  logger.info({ payload }, '📦 [DISPATCH READY] Registration data prepared for external API endpoint');
-  
-  // TODO: Hubungkan ke endpoint API tujuan ketika URL & auth sudah disediakan:
-  // const response = await axios.post(process.env.SERVICE_REGISTRATION_ENDPOINT, payload);
-  // return response.data;
+function buildHomeServicePayload(regData) {
+  // Customer's own words first; the rest are internal notes for the admin
+  const deskripsiParts = [regData.complaint || regData.kendala];
+  if (regData.vehicle) deskripsiParts.push(`Jenis kendaraan: ${regData.vehicle === 'motor' ? 'Motor listrik' : 'Sepeda listrik'}`);
+  if (regData.kendaraan) deskripsiParts.push(`Kendaraan: ${regData.kendaraan}`);
+  if (regData.aiSummary) deskripsiParts.push(`Ringkasan AI (internal): ${regData.aiSummary}`);
+  if (regData.diagnosis?.isDefault) deskripsiParts.push('Catatan: jenis kerusakan belum spesifik, perlu pengecekan teknisi.');
+  if (regData.diagnosis?.geminiFailed) deskripsiParts.push('Catatan: analisis otomatis gagal, estimasi perlu dikonfirmasi admin.');
+  if (regData.jadwal?.raw) deskripsiParts.push(`Permintaan jadwal konsumen: "${regData.jadwal.raw}"`);
+  deskripsiParts.push('(Didaftarkan via chatbot WhatsApp)');
 
   return {
-    success: true,
-    dispatched: false,
-    message: 'Data successfully formatted and buffered. Ready for external endpoint integration.',
-    payload,
+    namaLengkap: regData.nama,
+    noTelp: regData.contactPhone,
+    alamatLengkap: regData.alamat,
+    latitude: String(regData.location.latitude),
+    longitude: String(regData.location.longitude),
+    idJenisKerusakan: String(regData.diagnosis.jenis.id),
+    deskripsi: deskripsiParts.join('\n'),
+    tanggal: regData.jadwal.tanggal,
+    waktuMulai: regData.jadwal.waktuMulai,
+    waktuSelesai: regData.jadwal.waktuSelesai,
   };
 }
 
 module.exports = {
+  PHOTO_MARKER,
+  hasPhotoAttachment,
   isRegistrationForm,
   parseRegistrationForm,
   parseLocationMessage,
   getRegistration,
   saveRegistration,
   clearRegistration,
-  buildApiRequestBody,
-  dispatchRegistrationToEndpoint,
+  buildHomeServicePayload,
 };

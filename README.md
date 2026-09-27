@@ -68,6 +68,46 @@ npm start
 Setelah aplikasi berjalan, QR code akan muncul di terminal.
 Scan menggunakan WhatsApp di HP yang akan dipakai sebagai chatbot SMH Support.
 
+## Menjalankan 24/7 dengan PM2
+
+PM2 menjaga bot tetap hidup: otomatis restart saat crash (dengan jeda bertahap maks. 15 detik) dan saat memori > 500 MB. Konfigurasi ada di `ecosystem.config.js`.
+
+> ⚠️ Bot **wajib 1 proses saja** (satu sesi WhatsApp). Jangan ubah `instances` / jangan jalankan `npm run dev` bersamaan dengan PM2 — dua proses akan saling menendang sesi WhatsApp.
+
+**Persiapan (sekali saja):**
+
+```bash
+npm install -g pm2
+npm run db:migrate          # mode production TIDAK menjalankan sequelize.sync()
+npm start                   # jika belum pernah login: scan QR, lalu Ctrl+C
+```
+
+**Perintah harian:**
+
+| Perintah | Fungsi |
+|---|---|
+| `npm run pm2:start` | Menjalankan bot (NODE_ENV=production) |
+| `npm run pm2:status` | Cek status proses |
+| `npm run pm2:logs` | Lihat log (QR code juga muncul di sini bila perlu scan ulang) |
+| `npm run pm2:restart` | Restart setelah update kode / `.env` |
+| `npm run pm2:stop` | Menghentikan bot |
+
+Log tersimpan di folder `logs/`. Pada mode production format log berupa JSON (tanpa pino-pretty).
+
+**Redis:** bot membutuhkan Redis yang selalu hidup. Di Linux/VPS gunakan service OS (`sudo systemctl enable --now redis-server`). Di Windows tanpa service Redis, PM2 bisa sekaligus menjaga Redis:
+
+```powershell
+$env:REDIS_SERVER_PATH = "C:\path\ke\redis-server.exe"
+npm run pm2:start           # menjalankan smh-redis + smh-bot
+```
+
+**Otomatis jalan saat server/PC menyala:**
+
+- **Linux:** `pm2 startup` (ikuti perintah yang dicetak), lalu `pm2 save`.
+- **Windows:** `pm2 startup` tidak didukung. Gunakan paket pihak ketiga, misalnya `pm2-installer` (memasang PM2 sebagai Windows Service), lalu `pm2 save`.
+
+**Perilaku reconnect WhatsApp:** bot terus mencoba reconnect tanpa batas (jeda 2s → 5s → 10s → 30s → 60s, lalu tiap 60s). Email alert dikirim **sekali** saat gagal 5x berturut-turut. Kondisi yang butuh tindakan manual (bot berhenti mencoba + email alert): **logout** (scan QR ulang), **nomor diblokir (403)**, dan **sesi diambil alih koneksi lain (440)**.
+
 ## API Endpoints
 
 > **Catatan Autentikasi:** Semua endpoint `/api/tickets` membutuhkan header `x-api-key: <API_KEY>` atau `Authorization: Bearer <API_KEY>`. Endpoint `/api/health` dapat diakses secara publik.

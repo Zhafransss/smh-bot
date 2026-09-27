@@ -8,7 +8,21 @@
  */
 function normalizePhone(jid) {
   if (!jid) return null;
-  return jid.replace(/@.*$/, '').replace(/[^0-9]/g, '');
+  // Strip server part and multi-device suffix ("628123:12@s.whatsapp.net" → "628123")
+  return jid.replace(/@.*$/, '').replace(/:\d+$/, '').replace(/[^0-9]/g, '');
+}
+
+/**
+ * Convert an international Indonesian number to the local format used by the website
+ * (data_pelanggans.noHP is stored as typed in web forms, e.g. "081234567890").
+ * Example: "6281234567890" → "081234567890". Non-Indonesian numbers are returned with "+".
+ */
+function toLocalPhone(phone) {
+  if (!phone) return null;
+  const digits = String(phone).replace(/[^0-9]/g, '');
+  if (digits.startsWith('62')) return `0${digits.slice(2)}`;
+  if (digits.startsWith('0')) return digits;
+  return `+${digits}`;
 }
 
 /**
@@ -60,6 +74,7 @@ function formatRupiah(amount) {
 
 module.exports = {
   normalizePhone,
+  toLocalPhone,
   generateTicketNumber,
   formatDateID,
   startOfTodayWIB,

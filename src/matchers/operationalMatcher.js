@@ -1,4 +1,4 @@
-const { normalizeText } = require('./keywordMatcher');
+const { normalizeText } = require('../utils/textNormalizer');
 
 const OPERATIONAL_DATA = {
   store1: {
@@ -24,189 +24,195 @@ const OPERATIONAL_DATA = {
  * @returns {boolean}
  */
 function isHomeServiceOutsideHours(text) {
-  // Pattern: jam 5, 6, 7, 8 pagi, or jam 21, 22, 23, 24, jam 9 malam, jam 10 malam
-  const outsidePatterns = [
-    /\bjam\s*(?:[1-8]|0[1-8])(?:\.00|:00)?\s*(?:pagi)?\b/,
-    /\bjam\s*(?:2[1-4])(?:\.00|:00)?\b/,
-    /\bjam\s*(?:9|10|11|12)\s*malam\b/,
-    /\bpukul\s*(?:[1-8]|0[1-8])(?:\.00|:00)?\b/,
-    /\bpukul\s*(?:2[1-4])(?:\.00|:00)?\b/,
-  ];
-  return outsidePatterns.some((pattern) => pattern.test(text));
+  if (!text) return false;
+
+  // Explicit Sunday request ("hari minggu", "minggu pagi", "ahad") — not "minggu depan/ini/lalu" (= week)
+  const sundayPattern = /\b(?:ahad|hari\s+minggu|minggu(?!\s*(?:depan|ini|lalu|kemarin|ke|an)\b))\b/;
+  if (sundayPattern.test(text)) return true;
+
+  // "jam 8", "jam 1 siang", "pukul 19 30", "jam 10an malam".
+  // Text is already normalized, so "19.30" / "8:30" arrive as "19 30" / "8 30".
+  const timePattern = /\b(?:jam|pukul)\s*(\d{1,2})(?:an)?(?:\s+(\d{2}))?(?:\s+(pagi|siang|sore|malam|subuh|dini hari))?\b/g;
+  const startMinutes = OPERATIONAL_DATA.homeServiceStartHour * 60;
+  const endMinutes = OPERATIONAL_DATA.homeServiceEndHour * 60;
+  const isWithinHours = (hour24, minute) => {
+    const t = hour24 * 60 + minute;
+    return t >= startMinutes && t < endMinutes;
+  };
+
+  for (const match of text.matchAll(timePattern)) {
+    const hour = parseInt(match[1], 10);
+    const minute = match[2] && parseInt(match[2], 10) <= 59 ? parseInt(match[2], 10) : 0;
+    const period = match[3];
+    if (hour > 24) continue;
+
+    const candidates = toHour24Candidates(hour, period);
+    // Only reject when EVERY plausible reading is outside hours ("jam 3" could be 15.00 → accept)
+    if (!candidates.some((h) => isWithinHours(h, minute))) return true;
+  }
+
+  return false;
 }
 
 /**
- * Match operational info queries (Layer B)
+ * Convert a spoken Indonesian hour (+ optional period word) into possible 24h hours.
+ * Without a period word, 1–11 is ambiguous (pagi or sore/malam) so both readings are returned.
+ * @param {number} hour
+ * @param {string} [period]
+ * @returns {number[]}
+ */
+function toHour24Candidates(hour, period) {
+  const h = hour % 24;
+  switch (period) {
+    case 'pagi':
+    case 'subuh':
+    case 'dini hari':
+      return [h === 12 ? 0 : h];
+    case 'siang':
+      return [h >= 10 ? h : h + 12]; // "jam 11 siang" = 11, "jam 1 siang" = 13
+    case 'sore':
+      return [h < 12 ? h + 12 : h];
+    case 'malam':
+      if (h === 12) return [0];
+      return [h >= 6 ? h + 12 : h]; // "jam 9 malam" = 21, "jam 1 malam" = 01
+    default:
+      return h >= 1 && h <= 11 ? [h, h + 12] : [h];
+  }
+}
+
+const COMPLAINT_INVITE =
+  `Silakan *ceritakan keluhan/kendala* sepeda listrik atau motor listrik kakak ya (misal: "motor listrik tidak bisa dicas", "rem sepeda bunyi"). ` +
+  `Kami akan bantu cek jenis kerusakannya beserta *estimasi biayanya*. 😊`;
+
+const GREETING_WORDS = [
+  'halo', 'hai', 'hi', 'hey', 'p', 'tes', 'test',
+  'assalamualaikum', 'assalamu alaikum', 'assalamu alaikom',
+  'selamat pagi', 'selamat siang', 'selamat sore', 'selamat malam',
+  'pagi', 'siang', 'sore', 'malam', 'permisi',
+];
+
+const GREETING_REPLY =
+  `Halo kak! Selamat datang di *Selis Molis Hoki (SMH)* 🛵⚡\n` +
+  `Bengkel spesialis servis, perawatan, dan suku cadang sepeda listrik & motor listrik.\n\n` +
+  `${COMPLAINT_INVITE}\n\n` +
+  `Kakak juga bisa menanyakan *jam operasional* atau *lokasi toko* kami (Purwokerto & Cirebon).`;
+
+// ── Small talk (terima kasih / oke / pamit / tawa / emoji) ──
+// Short social messages never need the admin. Replies are fixed templates (no AI text).
+const SMALL_TALK_REPLIES = {
+  thanks:
+    `Sama-sama kak! 🙏 Senang bisa membantu. Jika ada kendala lain pada sepeda/motor listriknya, silakan chat kami kapan saja ya. 😊`,
+  ack:
+    `Siap kak! 👍 Jika ada yang ingin ditanyakan lagi atau ada keluhan pada kendaraannya, silakan chat kami kapan saja ya. 😊`,
+  bye: `Terima kasih sudah menghubungi Selis Molis Hoki, kak! Sampai jumpa 🙏`,
+  emoji: `😊 Ada lagi yang bisa kami bantu, kak? Silakan ceritakan keluhan kendaraannya, atau tanyakan jam operasional & lokasi toko kami.`,
+};
+
+// Compared after collapsing repeated letters ("siappp" → "siap", "okee" → "oke", "makasihh" → "makasih")
+const SMALL_TALK_WORDS = {
+  thanks: [
+    'makasih', 'makasi', 'maksih', 'mksh', 'mks', 'mkasih', 'trims', 'trimakasih', 'terimakasih', 'terimakasi',
+    'trimaksih', 'terima', 'trima', 'kasih', 'kasi', 'thanks', 'thank', 'thanku', 'thankyou', 'you', 'thx', 'tq', 'ty',
+    'tks', 'tengkyu', 'tenkyu', 'suwun', 'nuwun', 'matur', 'hatur', 'nuhun',
+  ],
+  bye: ['bye', 'dadah', 'dah', 'sampai', 'jumpa', 'wassalam', 'wassalamualaikum', 'pamit'],
+  ack: [
+    'ok', 'oke', 'okey', 'okay', 'okeh', 'okie', 'sip', 'siap', 'baik', 'baiklah', 'noted', 'mantap', 'mantab',
+    'mantul', 'good', 'nice', 'cool', 'betul', 'benar', 'iya', 'ya', 'yup', 'yoi', 'beres', 'aman', 'done', 'paham',
+    'mengerti', 'ngerti', 'oh', 'o', 'owh', 'hm', 'gpp', 'tunggu', 'ditunggu', 'nunggu', 'kabar', 'selanjutnya',
+    'tidak', 'gak', 'ga', 'nggak', 'ngga', 'engga', 'enggak', 'belum', 'no', 'cukup', 'itu', 'aja', 'saja',
+  ],
+};
+const SMALL_TALK_FILLERS = [
+  'kak', 'ka', 'kk', 'kakak', 'min', 'admin', 'mas', 'mb', 'mba', 'mbak', 'gan', 'bang', 'pak', 'bu', 'om', 'sis',
+  'ya', 'yah', 'deh', 'dong', 'sih', 'nih', 'lah', 'juga', 'jg', 'saya', 'aku', 'sy', 'sudah', 'udah', 'udh', 'sdh',
+  'banyak', 'byk', 'bnyk', 'sekali', 'bgt', 'banget', 'atas', 'info', 'infonya', 'informasinya', 'bantuannya',
+  'nya', 'ku', 'kalau', 'klo', 'gitu', 'begitu', 'kabarnya', 'selalu', 'semua',
+];
+const LAUGH_PATTERN = /^(?:w?k(?:wk)+w?|(?:ha)+h?|(?:he)+h?|(?:hi)+h?|(?:xi)+x?|lol)$/;
+
+function collapseRepeats(word) {
+  return word.replace(/(.)\1+/g, '$1');
+}
+const SMALL_TALK_LOOKUP = Object.fromEntries(
+  Object.entries(SMALL_TALK_WORDS).map(([category, words]) => [category, new Set(words.map(collapseRepeats))])
+);
+const FILLER_LOOKUP = new Set(SMALL_TALK_FILLERS.map(collapseRepeats));
+
+/**
+ * Recognize a short social message (thanks / ok / bye / laughter / emoji only).
+ * Every word must be small talk or filler, so "oke motor saya mogok" is NOT small talk.
  * @param {string} rawMessage
- * @returns {object|null}
+ * @returns {'thanks'|'bye'|'ack'|'emoji'|null}
+ */
+function detectSmallTalk(rawMessage) {
+  if (!rawMessage || typeof rawMessage !== 'string') return null;
+  if (rawMessage.includes('[')) return null; // photo / location markers are never small talk
+
+  const norm = normalizeText(rawMessage);
+  if (!norm) {
+    // Only emoji / punctuation ("👍", "🙏🙏", "?")
+    return rawMessage.trim() ? 'emoji' : null;
+  }
+
+  const tokens = norm.split(' ').map(collapseRepeats);
+  if (tokens.length > 8) return null;
+
+  const found = new Set();
+  for (const token of tokens) {
+    if (FILLER_LOOKUP.has(token)) continue;
+    if (LAUGH_PATTERN.test(token)) {
+      found.add('emoji');
+      continue;
+    }
+    const category = Object.keys(SMALL_TALK_LOOKUP).find((c) => SMALL_TALK_LOOKUP[c].has(token));
+    if (!category) return null; // a real word we don't know → not small talk
+    found.add(category);
+  }
+
+  for (const category of ['thanks', 'bye', 'ack', 'emoji']) {
+    if (found.has(category)) return category;
+  }
+  return null;
+}
+
+const GREETING_LOOKUP = new Set(GREETING_WORDS.map(collapseRepeats));
+
+function isGreetingOnly(norm) {
+  // "hallo kakk", "haiii" → same as "halo kak", "hai"
+  const collapsed = norm.split(' ').map(collapseRepeats);
+  if (GREETING_LOOKUP.has(collapsed.join(' '))) return true;
+  return collapsed.length <= 2 && GREETING_LOOKUP.has(collapsed[0]);
+}
+
+/**
+ * Layer B (info): questions answered from fixed operational data — greeting, remote area,
+ * store location, opening hours. Checked BEFORE complaint diagnosis.
+ * @param {string} rawMessage
+ * @returns {{ matched: true, layer: 'LAYER_B', subIntent: string, reply: string, invitesComplaint?: boolean } | null}
  */
 function matchOperationalInfo(rawMessage) {
+  // Basa-basi singkat (terima kasih, oke, pamit, emoji) → balasan template, tanpa admin
+  const smallTalk = detectSmallTalk(rawMessage);
+  if (smallTalk) {
+    return { matched: true, layer: 'LAYER_B', subIntent: `SMALL_TALK_${smallTalk.toUpperCase()}`, reply: SMALL_TALK_REPLIES[smallTalk] };
+  }
+
   const norm = normalizeText(rawMessage);
   if (!norm) return null;
 
-  // 0. Sapaan Pembuka (Greetings: Halo, Hai, Assalamualaikum, Pagi, Siang, dll)
-  const greetingWords = [
-    'halo',
-    'hai',
-    'hi',
-    'hey',
-    'p',
-    'tes',
-    'test',
-    'assalamualaikum',
-    'assalamu alaikum',
-    'assalamu alaikom',
-    'selamat pagi',
-    'selamat siang',
-    'selamat sore',
-    'selamat malam',
-    'pagi',
-    'siang',
-    'sore',
-    'malam',
-    'permisi',
-  ];
-
-  const isGreetingOnly = () => {
-    if (greetingWords.includes(norm)) return true;
-    const tokens = norm.split(' ');
-    if (tokens.length <= 2 && greetingWords.includes(tokens[0])) return true;
-    return false;
-  };
-
-  if (isGreetingOnly()) {
+  // Sapaan pembuka → persilakan konsumen menceritakan keluhan
+  if (isGreetingOnly(norm)) {
     return {
       matched: true,
       layer: 'LAYER_B',
       subIntent: 'GREETING',
-      reply:
-        `Halo kak! Selamat datang di *Selis Molis Hoki (SMH)* 🛵⚡\n` +
-        `Bengkel spesialis servis, perawatan, dan suku cadang sepeda listrik & motor listrik.\n\n` +
-        `Ada yang bisa kami bantu? Anda bisa menanyakan:\n` +
-        `• 🔧 *Biaya Servis* (Kelistrikan, baterai/cas, ban bocor, rem, dinamo BLDC, dll.)\n` +
-        `• ⏰ *Jam Operasional Bengkel & Layanan Home Service*\n` +
-        `• 📍 *Lokasi Toko* (Purwokerto & Cirebon)\n` +
-        `• 🛵 *Panggilan ke Rumah (Home Service)*\n\n` +
-        `Silakan ceritakan kendala atau kebutuhan kendaraan listrik Anda ya kak. 😊`,
+      invitesComplaint: true,
+      reply: GREETING_REPLY,
     };
   }
 
-  // 0.1 Permintaan Servis Umum tanpa rincian kendala (misal: "saya ingin service molis")
-  const isGeneralServiceInquiry = () => {
-    const hasServiceIntent =
-      norm.includes('ingin servis') ||
-      norm.includes('mau servis') ||
-      norm.includes('bisa servis') ||
-      norm.includes('butuh servis') ||
-      norm.includes('perlu servis') ||
-      norm.includes('minta servis') ||
-      norm === 'servis' ||
-      norm === 'servis molis' ||
-      norm === 'servis selis' ||
-      norm === 'servis motor listrik' ||
-      norm === 'servis sepeda listrik';
-
-    const specificSymptoms = ['bocor', 'cas', 'charger', 'rem', 'rantai', 'aki', 'baterai', 'kontak', 'kabel', 'ban', 'las', 'jok', 'shock'];
-    const hasSpecificSymptom = specificSymptoms.some((s) => norm.includes(s));
-
-    return hasServiceIntent && !hasSpecificSymptom;
-  };
-
-  if (isGeneralServiceInquiry()) {
-    return {
-      matched: true,
-      layer: 'LAYER_B',
-      subIntent: 'SERVICE_MENU_GUIDANCE',
-      reply:
-        `Halo kak! Kami siap membantu servis sepeda & motor listrik Anda di *Bengkel* maupun via *Home Service (panggilan ke rumah)*. 🛵⚡\n\n` +
-        `Layanan servis kami meliputi:\n` +
-        `1. ⚡ *Kelistrikan:* Pengecekan mati total, tidak mau digas, korslet, custom kabel body\n` +
-        `2. 🔋 *Baterai & Charger:* Servis aki SLA, balancing lithium, colokan/cas rusak, tukar tambah aki\n` +
-        `3. 🛠️ *Mekanis & Roda:* Tambal ban bocor, rem blong/ngempos, rantai/vanbelt macet, shockbreaker\n` +
-        `4. ⚙️ *Dinamo & Kontroller:* Servis dinamo BLDC recoil, turun mesin, tuning\n` +
-        `5. 🛵 *Home Service:* Kunjungan teknisi langsung ke rumah Anda\n\n` +
-        `Untuk pendaftaran dan penjadwalan servis, silakan balas dengan mengisi format berikut ya kak:\n` +
-        `- Atas nama:\n` +
-        `- Alamat:\n` +
-        `- Foto unit:\n` +
-        `- Kendala:\n\n` +
-        `_Contoh: Jika belum sempat foto, tuliskan merk/tipe kendaraan pada kolom foto unit lalu kirimkan fotonya setelah ini._ 😊`,
-    };
-  }
-
-  // 0.2 Deteksi Keluhan / Laporan Masalah Kendaraan Spesifik
-  const isVehicleComplaint = () => {
-    const issueKeywords = [
-      'rusak', 'mati total', 'mati', 'mogok', 'ngempos', 'blong', 'bocor', 'korslet',
-      'gak nyala', 'tidak nyala', 'ga nyala', 'tidak mau jalan', 'gak mau jalan', 'ga mau jalan',
-      'tidak bisa jalan', 'gak bisa jalan', 'ga bisa jalan', 'bunyi', 'macet', 'habis baterai',
-      'baterai drop', 'aki drop', 'cas tidak masuk', 'tidak bisa dicas', 'gak bisa dicas', 'ga bisa dicas',
-      'gabisa dicas', 'tidak mengisi', 'gak mengisi', 'kempes', 'putus', 'patah', 'goyang'
-    ];
-    const componentKeywords = [
-      'cas', 'charger', 'aki', 'baterai', 'rem', 'ban', 'rantai', 'dinamo', 'gas',
-      'kabel', 'mesin', 'sepeda', 'motor', 'unit', 'kelistrikan', 'kontroller'
-    ];
-
-    const hasIssue = issueKeywords.some((w) => norm.includes(w));
-    const hasComponent = componentKeywords.some((c) => norm.includes(c));
-
-    return hasIssue && (hasComponent || norm.includes('kendala') || norm.includes('masalah'));
-  };
-
-  if (isVehicleComplaint()) {
-    return {
-      matched: true,
-      layer: 'LAYER_B',
-      subIntent: 'VEHICLE_COMPLAINT_INTENT',
-      reply:
-        `Halo kak! Kendala kendaraan listrik Anda siap ditangani oleh tim teknisi spesialis Selis Molis Hoki. 🛵⚡\n\n` +
-        `💰 *Estimasi Biaya:* Untuk pemeriksaan & perbaikan kendala standar (kelistrikan/mekanis) mulai dari *Rp25.000 - Rp35.000* (biaya akhir akan dikonfirmasi teknisi setelah pengecekan kondisi fisik unit).\n\n` +
-        `🛵⚡ Layanan perbaikan kami bisa dilakukan langsung di *Bengkel* maupun melalui *Home Service (teknisi kami datang ke rumah)*.\n\n` +
-        `Untuk pendaftaran dan penjadwalan servis, silakan balas dengan mengisi format berikut ya kak:\n` +
-        `- Atas nama:\n` +
-        `- Alamat:\n` +
-        `- Foto unit:\n` +
-        `- Kendala:\n\n` +
-        `_Contoh: Jika belum sempat foto, tuliskan merk/tipe kendaraan pada kolom foto unit lalu kirimkan fotonya setelah ini._ 😊`,
-    };
-  }
-
-  // 0.3 Deteksi Pertanyaan Biaya / Daftar Harga Servis Umum
-  const isGeneralPriceInquiry = () => {
-    const priceKeywords = [
-      'harga servis', 'biaya servis', 'ongkos servis', 'tarif servis',
-      'daftar harga', 'price list', 'pricelist', 'berapa biaya', 'berapa harga',
-      'biayanya berapa', 'harganya berapa', 'ongkosnya berapa', 'kisaran biaya'
-    ];
-    return priceKeywords.some((p) => norm.includes(p));
-  };
-
-  if (isGeneralPriceInquiry()) {
-    return {
-      matched: true,
-      layer: 'LAYER_B',
-      subIntent: 'GENERAL_PRICE_INQUIRY',
-      reply:
-        `Halo kak! Berikut estimasi daftar biaya servis di *Selis Molis Hoki*: 🛵⚡\n\n` +
-        `1. ⚡ *Biaya Servis Elektris:* Mulai Rp35.000\n` +
-        `   _(Pengecekan kelistrikan, kendala cas, sensor, dinamo standar)_\n` +
-        `2. 🛠️ *Biaya Servis Mekanis:* Mulai Rp25.000\n` +
-        `   _(Rem ngempos/blong, rantai, ban, penyetelan fisik)_\n` +
-        `3. 🔋 *Servis & Balancing Aki/Baterai:* Mulai Rp15.000\n` +
-        `4. ⚙️ *Servis Dinamo BLDC / Turun Mesin:* Mulai Rp75.000\n` +
-        `5. 🛵 *Home Service:* Kunjungan teknisi langsung ke rumah Anda\n\n` +
-        `Layanan dapat dilakukan di *Bengkel* maupun via *Home Service*.\n\n` +
-        `Untuk pendaftaran dan penjadwalan servis, silakan balas dengan mengisi format berikut ya kak:\n` +
-        `- Atas nama:\n` +
-        `- Alamat:\n` +
-        `- Foto unit:\n` +
-        `- Kendala:\n\n` +
-        `_Contoh: Jika belum sempat foto, tuliskan merk/tipe kendaraan pada kolom foto unit lalu kirimkan fotonya setelah ini._ 😊`,
-    };
-  }
-
-  // 1. Outside Area / Remote Consultation (Bengkel belum buka di kota tertentu)
+  // Outside Area / Remote Consultation (Bengkel belum buka di kota tertentu)
   const remotePatterns = [
     'belum buka di',
     'buka di kota',
@@ -232,66 +238,7 @@ function matchOperationalInfo(rawMessage) {
     };
   }
 
-  // 2. Home Service / Layanan ke Rumah
-  const homeServiceKeywords = [
-    'home service',
-    'homeservice',
-    'home servis',
-    'homeservis',
-    'panggilan ke rumah',
-    'servis panggil',
-    'servis ke rumah',
-    'servis di rumah',
-    'datang ke rumah',
-    'panggil ke rumah',
-    'panggil montir',
-    'panggil teknisi',
-    'mekanik ke rumah',
-    'teknisi ke rumah',
-  ];
-  const isHomeServiceQuery = homeServiceKeywords.some((kw) => norm.includes(kw));
-
-  if (isHomeServiceQuery) {
-    // Check if customer requested specific hours outside 09.00 - 20.00
-    if (isHomeServiceOutsideHours(norm)) {
-      return {
-        matched: true,
-        layer: 'LAYER_B',
-        subIntent: 'HOME_SERVICE_OUTSIDE_HOURS',
-        reply:
-          `Halo kak! Mohon maaf, untuk kunjungan Home Service hanya beroperasi pada:\n` +
-          `⏰ *Senin–Sabtu, pukul 09.00–20.00 WIB* (Minggu tutup).\n\n` +
-          `Permintaan di luar jam operasional belum dapat kami layani pada waktu tersebut, namun kakak tetap dapat melakukan *reservasi jadwal di jam operasional* dengan format:\n` +
-          `• Nama:\n` +
-          `• Alamat & Patokan:\n` +
-          `• Jenis Kendaraan & Merk:\n` +
-          `• Kendala yang Dialami:\n` +
-          `• Usulan Hari & Jam Kunjungan:\n\n` +
-          `Silakan balas pesan ini dengan data di atas ya kak. Terima kasih! 🙏`,
-      };
-    }
-
-    // Normal Home Service query
-    return {
-      matched: true,
-      layer: 'LAYER_B',
-      subIntent: 'HOME_SERVICE_GENERAL',
-      reply:
-        `Halo kak! Layanan *Home Service (kunjungan ke rumah)* Selis Molis Hoki siap melayani Anda. 🛵⚡\n\n` +
-        `⏰ *Jam Operasional Home Service:* Senin–Sabtu, 09.00–20.00 WIB.\n` +
-        `📍 *Wilayah Jangkauan:* Purwokerto & sekitarnya.\n\n` +
-        `Untuk pendaftaran kunjungan teknisi, silakan kirimkan data berikut:\n` +
-        `• Nama:\n` +
-        `• No. WhatsApp:\n` +
-        `• Alamat Lengkap & Patokan:\n` +
-        `• Jenis Kendaraan (Sepeda / Motor Listrik) & Merk:\n` +
-        `• Kendala yang Dialami:\n` +
-        `• Rencana Hari & Jam Kunjungan:\n\n` +
-        `Teknisi kami akan segera memverifikasi jadwal kunjungan. Terima kasih! 🙏`,
-    };
-  }
-
-  // 3. Lokasi / Alamat Toko (Eksplisit bertanya alamat / cabang)
+  // Lokasi / Alamat Toko (Eksplisit bertanya alamat / cabang)
   const locationKeywords = [
     'alamat',
     'lokasi',
@@ -327,7 +274,7 @@ function matchOperationalInfo(rawMessage) {
     };
   }
 
-  // 4. Jam Operasional / Jam Tutup / Jam Buka
+  // Jam Operasional / Jam Tutup / Jam Buka
   const hoursKeywords = [
     'tutup jam berapa',
     'buka jam berapa',
@@ -361,8 +308,94 @@ function matchOperationalInfo(rawMessage) {
   return null;
 }
 
+/**
+ * Layer B (service inquiry): the customer wants service / home service / a price but has not
+ * described a problem yet. Checked AFTER complaint diagnosis found no complaint.
+ * Prices are never quoted here — estimates come only from the website's jenis kerusakan data.
+ * @param {string} rawMessage
+ * @returns {{ matched: true, layer: 'LAYER_B', subIntent: string, reply: string, invitesComplaint: true } | null}
+ */
+function matchServiceInquiry(rawMessage) {
+  const norm = normalizeText(rawMessage);
+  if (!norm) return null;
+
+  const homeServiceKeywords = [
+    'home service', 'homeservice', 'home servis', 'homeservis',
+    'panggilan ke rumah', 'servis panggil', 'servis ke rumah', 'servis di rumah',
+    'datang ke rumah', 'panggil ke rumah', 'panggil montir', 'panggil teknisi',
+    'mekanik ke rumah', 'teknisi ke rumah',
+  ];
+  if (homeServiceKeywords.some((kw) => norm.includes(kw))) {
+    const outsideHours = isHomeServiceOutsideHours(norm);
+    return {
+      matched: true,
+      layer: 'LAYER_B',
+      subIntent: outsideHours ? 'HOME_SERVICE_OUTSIDE_HOURS' : 'HOME_SERVICE_GENERAL',
+      invitesComplaint: true,
+      reply:
+        (outsideHours
+          ? `Halo kak! Mohon maaf, kunjungan Home Service hanya beroperasi pada *Senin–Sabtu, pukul 09.00–20.00 WIB* (Minggu tutup). ` +
+            `Kakak tetap bisa mendaftar untuk jadwal di jam operasional ya.\n\n`
+          : `Halo kak! Layanan *Home Service (teknisi datang ke rumah)* Selis Molis Hoki siap melayani Anda. 🛵⚡\n` +
+            `⏰ Senin–Sabtu, 09.00–20.00 WIB.\n\n`) + COMPLAINT_INVITE,
+    };
+  }
+
+  const serviceKeywords = [
+    'ingin servis', 'mau servis', 'bisa servis', 'butuh servis', 'perlu servis', 'minta servis',
+    'harga servis', 'biaya servis', 'ongkos servis', 'tarif servis', 'daftar harga', 'price list',
+    'pricelist', 'berapa biaya', 'berapa harga', 'biayanya berapa', 'harganya berapa', 'ongkosnya berapa',
+    'kisaran biaya',
+  ];
+  const isBareService = ['servis', 'servis motor listrik', 'servis sepeda listrik'].includes(norm);
+  if (isBareService || serviceKeywords.some((kw) => norm.includes(kw))) {
+    return {
+      matched: true,
+      layer: 'LAYER_B',
+      subIntent: 'SERVICE_INQUIRY',
+      invitesComplaint: true,
+      reply: `Halo kak! Kami siap membantu servis sepeda & motor listrik kakak, di *Bengkel* maupun via *Home Service*. 🛵⚡\n\n${COMPLAINT_INVITE}`,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Offline heuristic used ONLY when the Gemini diagnosis is unavailable: does the message look
+ * like a description of a vehicle problem?
+ * @param {string} rawMessage
+ * @returns {boolean}
+ */
+function looksLikeVehicleComplaint(rawMessage) {
+  const norm = normalizeText(rawMessage);
+  if (!norm) return false;
+  const issueKeywords = [
+    'rusak', 'mati total', 'mati', 'mogok', 'ngempos', 'blong', 'bocor', 'korslet',
+    'gak nyala', 'tidak nyala', 'ga nyala', 'tidak mau jalan', 'gak mau jalan', 'ga mau jalan',
+    'tidak bisa jalan', 'bunyi', 'macet', 'habis baterai', 'baterai drop', 'aki drop',
+    'tidak bisa dicas', 'tidak mengisi', 'gak mengisi', 'kempes', 'putus', 'patah', 'goyang',
+    'error', 'tidak mau digas', 'tidak bisa digas', 'lemah', 'seret', 'retak', 'pecah', 'kode',
+  ];
+  const componentKeywords = [
+    'cas', 'aki', 'baterai', 'rem', 'ban', 'rantai', 'dinamo', 'gas', 'kabel', 'mesin',
+    'sepeda', 'motor', 'unit', 'kelistrikan', 'kontroller', 'speedometer', 'alarm', 'shock',
+    'spion', 'lampu', 'layar', 'stang',
+  ];
+  const hasIssue = issueKeywords.some((w) => norm.includes(w));
+  const hasComponent = componentKeywords.some((c) => norm.includes(c));
+  return hasIssue && (hasComponent || norm.includes('kendala') || norm.includes('masalah'));
+}
+
 module.exports = {
   OPERATIONAL_DATA,
+  COMPLAINT_INVITE,
+  GREETING_REPLY,
+  SMALL_TALK_REPLIES,
+  detectSmallTalk,
   isHomeServiceOutsideHours,
+  toHour24Candidates,
   matchOperationalInfo,
+  matchServiceInquiry,
+  looksLikeVehicleComplaint,
 };

@@ -5,6 +5,9 @@ const logger = require('../utils/logger');
 
 let messageQueue = null;
 const BUFFER_KEY_PREFIX = 'msg_buffer:';
+const LAST_RECEIVED_KEY_PREFIX = 'msg_last_received:';
+const LAST_JOB_KEY_PREFIX = 'msg_last_job:';
+const BUFFER_TTL_SECONDS = 300; // 5 minutes safety expiry
 
 /**
  * Get or create the BullMQ message queue
@@ -36,38 +39,43 @@ function getQueue() {
 
 /**
  * Enqueue message with debounce mechanism to aggregate consecutive messages (PRD Bagian 5 & 9)
- * @param {{ phoneNumber: string, messageText: string, waMessageId: string, remoteJid: string, msgKey: object }} data
+ * @param {{ phoneNumber: string, phoneResolved?: boolean, messageText: string, waMessageId: string, remoteJid: string, msgKey: object, mediaPath?: string|null }} data
  * @param {number} [customDelay] - Optional delay override in milliseconds
  */
 async function enqueueMessage(data, customDelay) {
   const redis = getRedisClient();
   const queue = getQueue();
-  const { phoneNumber, messageText, waMessageId, remoteJid, msgKey } = data;
+  const { phoneNumber, phoneResolved = true, messageText, waMessageId, remoteJid, msgKey, mediaPath = null } = data;
 
   const delayMs = customDelay !== undefined ? customDelay : MESSAGE_DEBOUNCE_DELAY_MS;
   const bufferKey = `${BUFFER_KEY_PREFIX}${phoneNumber}`;
+  const lastJobKey = `${LAST_JOB_KEY_PREFIX}${phoneNumber}`;
+  const receivedAt = Date.now();
 
   const itemPayload = JSON.stringify({
     waMessageId,
     messageText,
     remoteJid,
     msgKey,
-    receivedAt: Date.now(),
+    mediaPath,
+    phoneResolved,
+    receivedAt,
   });
 
-  // 1. Append message into Redis list buffer
+  // 1. Append message into Redis list buffer & remember the newest arrival time
   await redis.rpush(bufferKey, itemPayload);
-  await redis.expire(bufferKey, 300); // 5 minutes safety expiry
+  await redis.expire(bufferKey, BUFFER_TTL_SECONDS);
+  await redis.set(`${LAST_RECEIVED_KEY_PREFIX}${phoneNumber}`, receivedAt, 'EX', BUFFER_TTL_SECONDS);
 
-  // 2. Schedule or refresh delayed job in BullMQ
-  const jobId = `debounce_${phoneNumber}`;
-  const existingJob = await queue.getJob(jobId);
-
-  if (existingJob) {
-    const state = await existingJob.getState();
-    if (state === 'delayed') {
+  // 2. Best-effort: drop the previous still-delayed job so superseded jobs don't burn
+  //    rate-limiter tokens. Correctness does NOT depend on this — the worker skips
+  //    superseded jobs and serializes per phone number with a lock.
+  const previousJobId = await redis.get(lastJobKey);
+  if (previousJobId) {
+    const previousJob = await queue.getJob(previousJobId);
+    if (previousJob && (await previousJob.getState()) === 'delayed') {
       try {
-        await existingJob.remove();
+        await previousJob.remove();
         logger.debug({ phoneNumber }, 'Refreshed debounce timer for consecutive message');
       } catch (err) {
         logger.debug({ err, phoneNumber }, 'Notice removing existing delayed job');
@@ -75,16 +83,10 @@ async function enqueueMessage(data, customDelay) {
     }
   }
 
-  const job = await queue.add(
-    'process-aggregated-messages',
-    { phoneNumber, remoteJid },
-    {
-      jobId,
-      delay: delayMs,
-      removeOnComplete: true,
-      removeOnFail: true,
-    }
-  );
+  // 3. Always schedule a NEW job (unique id). A fixed jobId was silently ignored by BullMQ
+  //    while the previous job was still active, leaving the new message stuck in the buffer.
+  const job = await scheduleProcessing({ phoneNumber, remoteJid, enqueuedAt: receivedAt, delayMs }, delayMs);
+  await redis.set(lastJobKey, job.id, 'EX', BUFFER_TTL_SECONDS);
 
   logger.debug(
     { jobId: job.id, phoneNumber, delayMs },
@@ -92,6 +94,21 @@ async function enqueueMessage(data, customDelay) {
   );
 
   return job;
+}
+
+/**
+ * Schedule a delayed aggregation job for a phone number
+ * @param {{ phoneNumber: string, remoteJid: string, enqueuedAt: number, delayMs: number }} data
+ * @param {number} delayMs
+ */
+async function scheduleProcessing(data, delayMs) {
+  const uniqueSuffix = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  return getQueue().add('process-aggregated-messages', data, {
+    jobId: `debounce_${data.phoneNumber}_${uniqueSuffix}`,
+    delay: delayMs,
+    removeOnComplete: true,
+    removeOnFail: true,
+  });
 }
 
 /**
@@ -115,7 +132,9 @@ async function closeQueue() {
 module.exports = {
   getQueue,
   enqueueMessage,
+  scheduleProcessing,
   addToQueue,
   closeQueue,
   BUFFER_KEY_PREFIX,
+  LAST_RECEIVED_KEY_PREFIX,
 };

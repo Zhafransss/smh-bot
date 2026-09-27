@@ -1,5 +1,8 @@
 {
-  "watch": ["src/"],
+  "watch": [
+    "src/",
+    ".env"
+  ],
   "ext": "js,json",
   "ignore": [
     "auth_state/**",

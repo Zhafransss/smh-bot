@@ -1,7 +1,20 @@
-const { matchOperationalInfo } = require('../matchers/operationalMatcher');
+const { matchOperationalInfo, matchServiceInquiry } = require('../matchers/operationalMatcher');
 const { matchUnitSales } = require('../matchers/unitSalesMatcher');
-const { matchLayerA } = require('../matchers/keywordMatcher');
 const logger = require('../utils/logger');
+
+/**
+ * Rule-based layers (no AI). Complaint → jenis kerusakan diagnosis lives in diagnosis.service.
+ *
+ * Message pipeline (see message.handler):
+ *   Layer C  jual-beli unit non-harga        → escalate to admin
+ *   Layer B  info (sapaan, lokasi, jam, …)   → fixed answer
+ *   Diagnosis keluhan (Gemini → jenis kerusakan website)
+ *   Layer B  service inquiry (mau servis/home service/harga, tanpa keluhan) → invite complaint
+ *   Layer D  fallback                          → escalate to admin
+ *
+ * Layer A (item_services keyword matching) was removed in PRD v1.2 — estimates now come
+ * exclusively from the website's jenis kerusakan data.
+ */
 
 /**
  * Standard admin escalation message (PRD Bagian 7.4)
@@ -11,113 +24,58 @@ const ADMIN_ESCALATION_REPLY =
   `Admin kami akan segera membalas pesan Anda secara manual. Mohon ditunggu ya kak! 🙏`;
 
 /**
- * Main matcher service to process incoming messages across Layer A, Layer B, and Layer C
- * @param {string} messageText - Incoming text from customer
- * @param {object} [options] - Optional configurations { threshold, forceRefresh }
- * @returns {Promise<object>} Matcher result object
+ * Layers checked before complaint diagnosis: C (escalate) then B info.
+ * @param {string} messageText
+ * @returns {object|null} match result, or null when no rule applies
  */
-async function matchIntent(messageText, options = {}) {
-  const threshold =
-    options.threshold !== undefined
-      ? options.threshold
-      : parseInt(process.env.MATCHER_THRESHOLD, 10) || 2;
-
-  logger.debug({ messageText, threshold }, 'Processing intent match');
-
-  // 1. Layer C: Check for Unit Sales Non-Price queries (Used units, stock, nego)
-  // Per PRD 7.3: Automatically escalates to admin without generic answers
+function matchRules(messageText) {
   const unitSalesResult = matchUnitSales(messageText);
   if (unitSalesResult && unitSalesResult.isEscalated) {
-    logger.info(
-      { reason: unitSalesResult.escalationReason },
-      'Matched Layer C (Unit Sales Non-Price) -> Escalate to admin'
-    );
+    logger.info({ reason: unitSalesResult.escalationReason }, 'Matched Layer C (Unit Sales Non-Price) -> Escalate to admin');
     return {
       matched: false,
       layer: 'LAYER_C',
-      item: null,
-      score: 0,
-      threshold,
       isEscalated: true,
       escalationReason: unitSalesResult.escalationReason,
       reply: ADMIN_ESCALATION_REPLY,
     };
   }
 
-  // 2. Layer A: PRIORITASKAN Pengecekan ke Database (item_services)
-  // Semua pesan servis/harga/kendala harus dicek terhadap katalog database terlebih dahulu
-  const layerAResult = await matchLayerA(messageText, { threshold, ...options });
-  if (layerAResult.matched) {
-    logger.info(
-      {
-        matchedItem: layerAResult.item.name,
-        score: layerAResult.score,
-        threshold: layerAResult.threshold,
-      },
-      'Matched Layer A (Service & Price from Database)'
-    );
-    return {
-      matched: true,
-      layer: 'LAYER_A',
-      item: layerAResult.item,
-      score: layerAResult.score,
-      threshold: layerAResult.threshold,
-      matchedKeywords: layerAResult.matchedKeywords,
-      isEscalated: false,
-      escalationReason: null,
-      reply: layerAResult.reply,
-    };
+  const infoResult = matchOperationalInfo(messageText);
+  if (infoResult) {
+    logger.info({ subIntent: infoResult.subIntent }, 'Matched Layer B (Operational Info)');
+    return { ...infoResult, isEscalated: false };
   }
 
-  // 3. Layer B: Check for Operational Info (Greeting, Store Location, Hours, General Pricing/Complaint Guidance)
-  const operationalResult = matchOperationalInfo(messageText);
-  if (operationalResult && operationalResult.matched) {
-    logger.info(
-      { subIntent: operationalResult.subIntent },
-      'Matched Layer B (Operational Info / General Service Guidance)'
-    );
-    return {
-      matched: true,
-      layer: 'LAYER_B',
-      item: null,
-      subIntent: operationalResult.subIntent,
-      score: 0,
-      threshold,
-      isEscalated: false,
-      escalationReason: null,
-      reply: operationalResult.reply,
-    };
-  }
+  return null;
+}
 
-  // 4. Layer D: Fallback / Escalation to Admin
-  // (Triggered by low_score, tie_score, or no_match yang bukan keluhan/servis)
-  logger.info(
-    {
-      reason: layerAResult.reason,
-      score: layerAResult.score,
-      threshold: layerAResult.threshold,
-    },
-    'No direct match in Layer A/B/C -> Triggering admin fallback'
-  );
+/**
+ * Layer B service inquiry — only used after diagnosis found no complaint.
+ * @param {string} messageText
+ */
+function matchServiceIntent(messageText) {
+  const result = matchServiceInquiry(messageText);
+  return result ? { ...result, isEscalated: false } : null;
+}
 
+/**
+ * Layer D fallback result.
+ * @param {string} [reason]
+ */
+function buildFallback(reason = 'no_match') {
   return {
     matched: false,
     layer: 'LAYER_D_FALLBACK',
-    item: layerAResult.item || null,
-    score: layerAResult.score,
-    threshold: layerAResult.threshold,
-    matchedKeywords: layerAResult.matchedKeywords || [],
     isEscalated: true,
-    escalationReason: layerAResult.reason || 'no_match',
-    topItems: layerAResult.topItems || [],
+    escalationReason: reason,
     reply: ADMIN_ESCALATION_REPLY,
   };
 }
 
 module.exports = {
   ADMIN_ESCALATION_REPLY,
-  matchIntent,
-  matchOperationalInfo,
-  matchUnitSales,
-  matchLayerA,
+  matchRules,
+  matchServiceIntent,
+  buildFallback,
 };

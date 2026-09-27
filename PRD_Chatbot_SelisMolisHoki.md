@@ -1,11 +1,18 @@
 # Product Requirements Document
-## Chatbot WhatsApp Rule-Based — Selis Molis Hoki
+## Chatbot WhatsApp — Selis Molis Hoki (rule-based + klasifikasi keluhan Gemini)
 
 | | |
 |---|---|
-| **Status** | Draft — hasil brainstorming |
-| **Dokumen versi** | 1.1 |
-| **Tanggal** | 22-23 September 2026 |
+| **Status** | Disetujui — revisi v1.2 |
+| **Dokumen versi** | 1.2 |
+| **Tanggal** | v1.1: 22-23 September 2026 · v1.2: 27 September 2026 |
+
+### Riwayat Revisi
+
+| Versi | Tanggal | Perubahan |
+|---|---|---|
+| 1.1 | 22-23 Sep 2026 | Draft awal: Layer A dari `item_services` + keyword `meta` (Gemini hanya batch/offline). |
+| 1.2 | 27 Sep 2026 | **Revisi scope disadari & disetujui pemilik.** Estimasi biaya tidak lagi dari `item_services`, melainkan dari **jenis kerusakan website** (`GET /api/jenis-kerusakan`). Keluhan konsumen diklasifikasikan **real-time oleh Gemini** ke salah satu jenis kerusakan (atau jenis *default*), dikonfirmasi konsumen, lalu dipakai untuk **membuat reservasi Home Service** via `POST /api/home-service`. Layer A & skrip keyword `item_services` dihapus. Servis bengkel (garage) tetap di luar scope bot. |
 
 ---
 
@@ -27,7 +34,8 @@ Dibutuhkan bot WhatsApp yang dapat menjawab pertanyaan-pertanyaan tersebut secar
 - Bot **tidak** menjawab pertanyaan katalog produk umum (sparepart/aksesoris/baterai) di luar konteks servis/trade **pada versi rilis pertama** — perluasan ke katalog produk sudah disepakati sebagai arah pengembangan berikutnya, lihat Bagian 7.5.
 - Bot **tidak** melakukan negosiasi harga, konfirmasi jadwal aktual, atau transaksi apa pun secara otomatis.
 - Bot **tidak** menjawab pertanyaan jual-beli unit bekas (stok, kondisi, nego) — ini otomatis dialihkan ke admin.
-- Tidak ada pemahaman bahasa alami berbasis LLM untuk *menjawab* konsumen — hanya rule/keyword matching (lihat Bagian 8 soal peran Gemini API).
+- LLM (Gemini) **tidak pernah menulis jawaban** untuk konsumen. Sejak v1.2 Gemini hanya dipakai sebagai *pengklasifikasi* keluhan → ID jenis kerusakan (lihat Bagian 8).
+- Bot hanya mendaftarkan **Home Service**. Reservasi servis di bengkel (garage) tidak ditangani bot — konsumen diarahkan datang langsung.
 
 ## 4. Arsitektur Sistem
 
@@ -42,90 +50,67 @@ Dibutuhkan bot WhatsApp yang dapat menjawab pertanyaan-pertanyaan tersebut secar
 | Alerting | Nodemailer | Notifikasi email saat koneksi WA down / eskalasi admin |
 | Logger | Pino | High-performance structured logging |
 | Security | Custom API Key & CORS Whitelist | Keamanan REST API |
-| Data Enrichment *(batch/offline, bukan jalur real-time)* | Gemini API | Menghasilkan kata kunci/sinonim per item `item_services`, disimpan ke kolom `meta` — lihat kebijakan lengkap di Bagian 8 |
+| Klasifikasi keluhan *(real-time, output terstruktur)* | Gemini API (`gemini-3.8-flash`, cadangan `gemini-3.1-flash-lite`, beberapa API key bergiliran) → cadangan **Groq API** (`openai/gpt-oss-120b`, `openai/gpt-oss-20b`) | Memetakan keluhan konsumen ke 1 ID jenis kerusakan website — kebijakan lengkap di Bagian 8 |
+| Integrasi Website | REST API website (X-API-KEY) | `GET /api/jenis-kerusakan` (daftar & estimasi), `POST /api/home-service` (buat reservasi) |
 
-## 5. Alur Proses Utama
+## 5. Alur Proses Utama (v1.2)
 
 ```
-Pesan masuk (WhatsApp)
+Pesan masuk (WhatsApp) → gabung pesan beruntun (debounce) → status "mengetik…"
     │
-    ▼
-BullMQ: tunggu jeda singkat untuk menggabungkan pesan beruntun
-    │
-    ▼
-Cek status percakapan di Redis
-    │
-    ├─ Status = "admin-handled" & belum lewat masa reset ──► Bot diam, tidak diproses
-    │
-    ▼ (status normal / sudah reset)
-Rule/Keyword Matcher
-    │
-    ├─ Cocok ke intent "info operasional" (hardcode) ──► Jawab dari data statis
-    │
-    ├─ Cocok ke item `item_services` (category service/trade) ──► Jawab dari DB
-    │       (harga, nama, ringkasan dari `keterangan`)
-    │
-    ├─ Pertanyaan jual-beli & harga item ADA di DB ──► Jawab dari DB
-    │
-    └─ Tidak cocok / confidence rendah / jual-beli non-harga ──► FALLBACK
-                │
-                ▼
-        Kirim 1x pesan "akan dibantu admin"
-        Set status Redis = "admin-handled" (+ timestamp)
-        Log ke MySQL untuk audit
-        (opsional, di-throttle) Notifikasi email ke admin
+    ├─ Status "admin-handled" (24 jam) ─────────────────────► Bot diam
+    ├─ Sedang dalam alur pendaftaran ───────────────────────► lanjutkan langkah berikutnya
+    ├─ Layer C: jual-beli unit non-harga ───────────────────► eskalasi admin
+    ├─ Layer B info: sapaan / lokasi / jam / luar kota ─────► jawaban statis
+    │      (sapaan → mempersilakan konsumen menceritakan keluhan)
+    ├─ Diagnosis keluhan (Gemini) ──────────────────────────► jenis kerusakan + estimasi (dari DB website)
+    ├─ Layer B servis tanpa keluhan (mau servis / harga) ───► minta konsumen menceritakan keluhan
+    └─ Tidak cocok ─────────────────────────────────────────► Layer D: eskalasi admin
 ```
 
-Status "admin-handled" di Redis **otomatis reset setelah 24 jam** (keputusan final), sehingga bot aktif kembali untuk user tersebut tanpa perlu aksi manual admin.
+**Alur diagnosis & reservasi:**
+
+1. Konsumen menceritakan keluhan (bebas).
+2. Bot mengambil daftar jenis kerusakan dari website, Gemini memilih **satu ID** yang paling sesuai. Tidak ada yang cocok → jenis **default** (`DEFAULT_JENIS_KERUSAKAN_ID`).
+3. Jika jenis kerusakan yang terpilih dibedakan sepeda/motor dan konsumen belum menyebutkan kendaraannya → bot **bertanya dulu** (harga berbeda).
+4. Bot menyampaikan **nama jenis kerusakan & estimasi biaya dari database website**, lalu bertanya: *YA* (daftar Home Service) / *TIDAK* / ceritakan lebih detail (diagnosis ulang, maks. 3 kali lalu eskalasi admin).
+5. *YA* → nama & alamat → foto unit (diunduh bot) → **pin lokasi konsumen** → hari & jam kunjungan → (nomor WA bila tidak terbaca).
+6. Bot `POST /api/home-service` → reservasi `pending` di website → konsumen menerima **no. resi, estimasi biaya, biaya perjalanan, jadwal yang diminta**.
+7. Admin mengonfirmasi / **reschedule** jadwal langsung dengan konsumen.
+
+Status "admin-handled" di Redis otomatis reset setelah 24 jam. Ketik *batal* kapan saja untuk membatalkan pendaftaran.
 
 ## 6. Model Data
 
-### 6.1 Tabel `item_services` (sudah ada, dump 22 September 2026)
+### 6.1 Sumber data estimasi: `jenis_kerusakans` (website)
 
-```
-id            bigint, PK
-code          varchar, nullable   -- slug semantik, mis. "service_elektris" (belum lengkap, ±120/238 baris NULL)
-name          varchar, not null
-price         bigint, not null
-unit          varchar, nullable   -- tidak konsisten: "item", "Pcs", "Km", "Panggil", dst.
-jenis         varchar             -- "debit" / "kredit"
-category      enum: baterai | sparepart | aksesoris | service | trade
-meta          longtext (JSON)     -- saat ini kosong di semua baris; DIUSULKAN dipakai untuk keyword bot
-created_at    timestamp
-updated_at    timestamp
-lokasi        enum: Gudang Aki | Etalase Inovasi | Etalase Sparepart | Pre order | Custom
-picture       varchar
-keterangan    text                -- deskripsi bebas, sumber konteks tambahan untuk jawaban bot
-```
+Diakses bot hanya lewat API website (tidak membaca DB website langsung):
 
-**Ruang lingkup data yang relevan untuk chatbot:** baris dengan `category IN ('service', 'trade')` — sekitar 41 dari 238 baris total.
+| Kolom | Keterangan |
+|---|---|
+| `id` | Dikirim sebagai `idJenisKerusakan` saat membuat reservasi |
+| `nama` | Pola `Kategori_Detail`, banyak dibedakan sepeda/motor (mis. `Charger_Motor Listrik Tidak bisa Mengisi`) |
+| `biaya_estimasi` | Satu-satunya sumber angka estimasi yang disampaikan ke konsumen |
 
-### 6.2 Catatan kualitas data (temuan review, perlu ditindaklanjuti sebelum implementasi)
+Jenis **default** (mis. "Pengecekan Umum") ditambahkan di website produksi; ID-nya diset di `.env` bot (`DEFAULT_JENIS_KERUSAKAN_ID`) dan **tidak pernah** ditawarkan ke Gemini sebagai pilihan.
 
-- Kolom `code` tidak konsisten diisi — jika dipakai sebagai kunci acuan intent, perlu dilengkapi.
-- Ditemukan indikasi duplikat/kemiripan data:
-  - `id 202` ("Kir Kelistrikan...") vs `id 203` ("Kit Kelistrikan...") — nama nyaris identik, harga sama (Rp375.000), kemungkinan salah ketik/duplikat entri.
-  - `id 245` "Ongkos Jasa Angkut dalam Kota" (Rp50.000/Km) vs `id 251` "Biaya perjalanan" (Rp5.000/Km) — dua konsep ongkos jalan dengan tarif berbeda jauh; berisiko bot salah pilih saat menjawab soal ongkos ke lokasi konsumen.
-- Ada pasangan harga "standar vs custom" untuk kasus elektris & mekanis:
-  | code | name | price |
-  |---|---|---|
-  | `service_elektris` | Biaya Servis Elektris | Rp35.000 |
-  | `service_elektris_custom` | Biaya Servis Elektris Custom | Rp50.000 |
-  | (id 230) | Pengecekan Kelistrikan sepeda listrik | Rp25.000 |
-  | (id 241) | Pengecekan Kelistrikan Motor Listrik Standar | Rp50.000 |
-  | `service_mekanis` | Biaya Servis Mekanis | Rp25.000 |
-  | (id 227) | Servis Mekanis Custom | Rp50.000 |
+### 6.2 `item_services`
 
-  Bot tidak dapat menentukan sendiri mana yang "custom" dari sekadar chat. Ketentuan produk: **selalu tawarkan harga standar dulu**, ditambah kalimat baku: *"Biaya bisa berbeda jika kondisi lebih rumit, akan dikonfirmasi teknisi setelah dicek."*
+Sejak v1.2 **tidak lagi dipakai oleh bot**. Temuan kualitas data v1.1 (duplikat, `code` kosong) tetap relevan untuk website/POS, bukan untuk bot.
+
+### 6.3 Data reservasi yang dikirim (`POST /api/home-service`)
+
+`namaLengkap`, `noTelp` (nomor WA pengirim, format lokal `08…`), `alamatLengkap`, `latitude`/`longitude` (pin lokasi konsumen), `idJenisKerusakan` (hasil diagnosis), `deskripsi` (kata-kata konsumen + catatan internal untuk admin), `gambar` (foto unit), `tanggal`, `waktuMulai`, `waktuSelesai` (slot 2 jam dari permintaan konsumen).
 
 ## 7. Spesifikasi Fungsional
 
-### 7.1 Layer A — Servis & Harga (dinamis dari database)
+### 7.1 Diagnosis Keluhan & Estimasi Biaya (menggantikan Layer A v1.1)
 
-- Sumber jawaban: baris `item_services` dengan `category IN ('service','trade')`.
-- Setiap baris punya "profil kata kunci" yang dipakai untuk mencocokkan pesan konsumen (lihat Bagian 8 soal cara menghasilkan kata kunci).
-- Jawaban dirakit dari template + nilai DB (`name`, `price`, ringkasan `keterangan`) — **bukan teks bebas yang di-generate ulang setiap kali**.
-- Aturan standar vs custom (Bagian 6.2) berlaku di sini.
+- Input: cerita keluhan konsumen (bisa beberapa pesan; detail tambahan digabung).
+- Gemini mengembalikan JSON terstruktur `{ is_complaint, vehicle, jenis_id, ringkasan }`; bot **memvalidasi** `jenis_id` harus ada di daftar yang dikirim.
+- Jenis kendaraan hanya diambil dari kata yang **benar-benar ditulis konsumen** (bukan tebakan Gemini).
+- Balasan ke konsumen dirakit dari template + `nama` & `biaya_estimasi` jenis kerusakan (database). Ringkasan Gemini hanya masuk ke `deskripsi` reservasi sebagai catatan internal admin.
+- Konsumen wajib mengonfirmasi (YA/TIDAK/detail) sebelum data pendaftaran diminta.
 
 ### 7.2 Layer B — Info Operasional (hardcode, statis)
 
@@ -135,73 +120,48 @@ Data final yang sudah dikonfirmasi pemilik usaha:
 - **Jam Home Service:** Senin–Sabtu, 09.00–20.00 WIB.
 - **Alamat Toko 1 (Pusat):** Jl. Jend Sudirman No. 32, Kebontebu Berkoh, Purwokerto Selatan, Jawa Tengah.
 - **Alamat Toko 2 (Cadangan):** Jl. Sultan Agung Sumber Sumber, Cirebon, Jawa Barat.
-- **Aturan penyebutan lokasi:** sebutkan kedua toko **hanya jika** ditanya eksplisit soal lokasi/alamat. Jika konteksnya default (mis. reservasi servis tanpa nanya lokasi), asumsikan Toko 1 Purwokerto.
-- **Bot tetap aktif menjawab di luar jam operasional** — jam operasional hanya dipakai untuk validasi permintaan home service (mis. menolak halus permintaan di luar 09.00–20.00), bukan pembatas jam aktif bot itu sendiri.
+- Sapaan, pertanyaan "mau servis/home service/harga" tanpa keluhan → bot mempersilakan konsumen menceritakan keluhan. **Tidak ada daftar harga hardcode** (v1.2).
+- Jadwal kunjungan yang diminta divalidasi terhadap jam Home Service (Senin–Sabtu 09.00–20.00 WIB); bot tetap aktif 24 jam.
 
 ### 7.3 Layer C — Jual-Beli Unit
 
-- Bot **hanya** menjawab jika pertanyaan adalah soal **harga** item yang barisnya ada di `item_services`.
-- Semua pertanyaan jual-beli lain (kondisi unit bekas, stok, nego, dll.) — **tanpa jawaban generik apa pun** — langsung dialihkan ke admin (masuk ke alur Fallback, Bagian 7.4).
+Pertanyaan jual-beli unit (bekas, stok, kondisi, nego) — tanpa jawaban generik — langsung dialihkan ke admin (Bagian 7.4).
 
 ### 7.4 Layer D — Fallback / Eskalasi ke Admin
 
-- Dipicu jika: tidak ada intent/item yang cocok, confidence terlalu rendah, atau kasus Layer C yang bukan pertanyaan harga.
-- Bot mengirim **satu kali** pesan pemberitahuan bahwa akan dibantu admin.
-- Status percakapan untuk nomor tersebut diset "admin-handled" di Redis — bot berhenti membalas thread itu.
-- Reset otomatis setelah durasi tertentu (default diusulkan 24 jam, dapat dikonfigurasi).
-- Setiap eskalasi dicatat ke MySQL untuk audit.
-- Notifikasi email ke admin (Nodemailer) di-throttle/batch — tidak satu email per satu eskalasi saat volume tinggi.
+- Dipicu jika: pesan bukan keluhan dan tidak cocok aturan mana pun; diagnosis belum sesuai setelah 3 kali penjelasan; daftar jenis kerusakan / jenis default tidak tersedia; atau pembuatan reservasi di website gagal.
+- Bot mengirim **satu kali** pesan pemberitahuan (jujur — tidak pernah menyatakan reservasi berhasil bila gagal), status percakapan diset "admin-handled" (24 jam), dicatat ke MySQL, dan email admin di-throttle berisi seluruh data yang sudah terkumpul.
 
-### 7.5 Layer E — Katalog Produk (arah pengembangan berikutnya, di luar rilis pertama)
+### 7.5 Pendaftaran Home Service
 
-Cakupan bot akan diperluas ke `category IN ('sparepart', 'aksesoris', 'baterai')` (≈197 dari 238 baris) — pertanyaan konsumen soal harga/ketersediaan produk fisik, bukan cuma jasa servis.
+- Foto unit diunduh bot dari WhatsApp dan dikirim sebagai file; lokasi wajib **pin lokasi WhatsApp** (link Google Maps ditolak dengan panduan).
+- Hari & jam ditulis bebas ("Senin jam 10", "besok jam 2 siang", "28/09 jam 13.00"); ditolak jika Minggu, di luar 09.00–20.00, sudah lewat, atau > 90 hari.
+- Nomor WhatsApp: nomor asli pengirim (ID `@lid` WhatsApp diterjemahkan); jika tetap tidak terbaca, bot menanyakan nomor.
+- `POST` tidak diulang otomatis (mencegah reservasi ganda); kegagalan → eskalasi admin.
 
-Prinsip yang sama tetap berlaku: **jawaban wajib berasal dari data di `item_services`, tidak boleh menebak.** Aturan tambahan khusus layer ini:
+## 8. Kebijakan Anti-Halusinasi & Peran Gemini API (revisi v1.2)
 
-- **Kalau hasil pencocokan mengarah ke lebih dari satu item** (mis. konsumen tanya "baterai lithium 36v" dan ada beberapa varian di database) → bot pilih **item dengan skor kecocokan (raw count) tertinggi**, bukan menampilkan semua opsi ke konsumen.
-- Kalau ada **skor seri (tie)** antar beberapa item → dianggap ambigu, bot tidak menebak, dialihkan ke admin (aturan ini konsisten dengan prinsip anti-halu di Bagian 8).
-- Kalau tidak ada item yang cocok sama sekali → fallback ke admin seperti biasa (Bagian 7.4), bot **tidak** boleh menjawab dengan estimasi/perkiraan harga produk sejenis.
+### 8.1 Peran Gemini
 
-## 8. Kebijakan Anti-Halusinasi & Peran Gemini API
+Gemini dipakai **real-time**, tetapi **hanya sebagai pengklasifikasi**: memilih satu ID dari daftar jenis kerusakan yang dikirim bot. Gemini tidak menulis kalimat untuk konsumen dan tidak pernah menyebut harga.
 
-Ini adalah **prinsip inti** sistem: jawaban yang dikirim ke konsumen tidak pernah berasal dari teks yang di-generate bebas oleh model AI.
+### 8.2 Jaminan desain
 
-### 8.1 Pemisahan tegas: penyiapan data vs pelayanan pesan
+- Setiap nama jenis kerusakan & angka estimasi yang dikirim ke konsumen **berasal langsung dari database website**.
+- Output Gemini dibatasi skema JSON; ID di luar daftar diabaikan (→ jenis default).
+- Konsumen mengonfirmasi hasil diagnosis; admin memverifikasi reservasi (`pending`).
+- Hanya teks keluhan yang dikirim ke penyedia AI (Gemini / Groq) — tanpa nama, nomor, alamat — pertimbangan privasi / UU PDP.
 
-| | Kapan dijalankan | Yang dilakukan | Boleh pakai Gemini API? |
-|---|---|---|---|
-| **Proses penyiapan (batch/offline)** | Sekali di awal untuk seluruh data servis, lalu diulang tiap ada item baru/berubah | Membaca `name` + `keterangan` tiap baris `item_services`, meminta Gemini menghasilkan daftar kata kunci/sinonim, menyimpan hasilnya ke kolom `meta` | **Ya** — karena hasilnya berupa metadata yang ditinjau/tersimpan, bukan langsung dikirim ke konsumen |
-| **Proses pelayanan pesan (real-time)** | Setiap ada pesan masuk dari konsumen | Mencocokkan teks pesan ke kata kunci yang sudah tersimpan di `meta`, memilih item dengan skor tertinggi, merakit jawaban dari template + data pasti (`name`, `price`, `keterangan`) | **Tidak** — tidak ada pemanggilan model AI generatif pada jalur ini sama sekali |
+### 8.3 Ketahanan (fallback)
 
-"Offline" di sini bukan berarti tanpa koneksi internet — proses batch tetap memanggil Gemini API secara online. Maksudnya adalah **proses ini terpisah dari alur balasan real-time ke konsumen**, sehingga hasil kerja Gemini selalu melewati tahap "disimpan ke database" sebelum sampai ke konsumen, bukan langsung dikirim sebagai jawaban.
-
-### 8.2 Jaminan yang diberikan desain ini
-
-- Setiap kalimat harga, nama layanan, dan estimasi yang dikirim ke konsumen **berasal langsung dari kolom di `item_services`** (`price`, `name`, `keterangan`) yang diisi/dikelola pemilik usaha — bukan hasil karangan AI.
-- Gemini API hanya berperan sebagai alat bantu **pelabelan/tagging**, setara pekerjaan yang sebelumnya harus dikerjakan manual satu per satu.
-- Kalau hasil pencocokan kata kunci tidak cukup yakin (skor di bawah ambang batas — lihat 8.3), bot **tidak menjawab sebisanya**, melainkan langsung ke jalur eskalasi admin.
-
-### 8.3 Parameter yang sudah diputuskan
-
-- **Metode skor kecocokan:** *raw count* — jumlah kata kunci di `meta` yang cocok dengan pesan konsumen (angka bulat, bukan rasio/persentase). Bisa dievaluasi ulang ke metode rasio nanti kalau raw count terbukti kurang akurat setelah dipakai produksi.
-- **Pemicu proses batch keyword:** manual sepenuhnya lewat developer, dengan alur: developer membuka database → import data item baru → menjalankan service Gemini → data keyword ter-generate → disimpan ke kolom `meta`. Tidak ada proses otomatis/terjadwal untuk versi ini.
-- **Format `meta`:** lihat contoh struktur JSON di bawah.
-- **Label audit `generated_by`:** batch yang disusun di luar pemanggilan Gemini API sungguhan (mis. penyiapan awal data) diberi label `"manual awal batch"`. Label `"gemini-batch-1"`, `"gemini-batch-2"`, dst. hanya dipakai untuk batch yang benar-benar dihasilkan lewat pemanggilan Gemini API, supaya kolom ini tetap bisa diaudit secara jujur.
-
-Contoh struktur `meta`:
-
-```json
-{
-  "keywords": ["cas", "charger", "tidak bisa dicas", "ngecas", "colokan rusak"],
-  "vehicle_hint": ["motor"],
-  "generated_by": "manual awal batch",
-  "generated_at": "2026-09-23"
-}
-```
-
-### 8.4 Parameter yang masih terbuka (perlu diuji di tahap teknis)
-
-- Nilai ambang batas (*confidence threshold*) minimal — angka pasti skor *raw count* minimal agar bot dianggap "yakin" menjawab. Metode sudah ditentukan (8.3), tapi angkanya baru bisa ditentukan setelah diuji dengan data/percakapan riil.
+| Kondisi | Perilaku |
+|---|---|
+| Satu API key Gemini kena limit (429) | Pindah ke key Gemini berikutnya (`GEMINI_API_KEYS`); key diistirahatkan sesuai waktu tunggu Google |
+| Model Gemini padat (503) / timeout / semua key limit | Coba model cadangan Gemini (`GEMINI_FALLBACK_MODEL`) |
+| Seluruh Gemini gagal | Pindah ke **Groq** (`CLASSIFIER_PROVIDERS=gemini,groq`), prompt & validasi yang sama |
+| Semua AI provider gagal & pesan tampak seperti keluhan | Pakai jenis default + catatan "estimasi dikonfirmasi ulang admin" |
+| Semua AI provider gagal & pesan bukan keluhan | Eskalasi admin |
+| Daftar jenis kerusakan / jenis default tidak tersedia | Eskalasi admin (bot tidak menebak estimasi) |
 
 ## 9. Kualitas & Nuansa Respons
 
@@ -219,13 +179,15 @@ Contoh struktur `meta`:
 
 ## 11. Risiko & Hal yang Perlu Ditindaklanjuti
 
-1. **Duplikasi/ambiguitas data** (Bagian 6.2) sebaiknya dibersihkan di database sebelum go-live — untuk item `service`/`trade`, ini mencegah keyword matching salah pilih SKU; untuk item katalog produk (Bagian 7.5), duplikasi/kemiripan nama berisiko memicu kasus "skor seri" yang berujung eskalasi ke admin padahal sebenarnya konsumen bertanya hal yang jelas.
-2. **Angka pasti ambang batas confidence** (Bagian 8.4) belum final — baru bisa ditentukan setelah diuji dengan data/percakapan riil pasca go-live.
-3. Layer katalog produk (Bagian 7.5) baru berupa aturan konsep — belum ada rincian teknis (query, endpoint, dsb) karena memang di luar cakupan rilis pertama.
+1. **Kuota & latensi Gemini** — kunci saat ini *free tier* (± 5 request/menit per model) dan model sering "high demand"; latensi teramati 3–10 detik. Untuk produksi disarankan mengaktifkan billing (paid tier).
+2. **Salah klasifikasi** — beberapa jenis kerusakan mirip dengan harga berbeda jauh (mis. "tidak bisa digas": Rp120.000–Rp485.000). Dimitigasi dengan konfirmasi konsumen, pertanyaan jenis kendaraan, dan verifikasi admin.
+3. **Privasi** — teks keluhan dikirim ke Google (Gemini). Cantumkan di kebijakan privasi toko bila diperlukan.
+4. **Ketergantungan API website** — endpoint `/api/jenis-kerusakan` & `/api/home-service` harus ter-deploy di produksi; `API_KEY` default yang tercantum di dokumentasi wajib diganti.
+5. **Jenis default** — `DEFAULT_JENIS_KERUSAKAN_ID` wajib diisi sesuai ID di produksi; tanpa itu keluhan yang tidak cocok akan dialihkan ke admin.
 
 ## 12. Lampiran
 
-### 12.1 Contoh Q&A asli (rujukan gaya bahasa & pola pertanyaan)
+### 12.1 Contoh Q&A asli (rujukan gaya bahasa & pola pertanyaan — pola jawaban harga di tabel ini dari v1.1, sejak v1.2 estimasi diambil dari jenis kerusakan website)
 
 | Pertanyaan Konsumen | Pola Jawaban |
 |---|---|

@@ -7,8 +7,10 @@ const { getRedisClient, closeRedis } = require('./config/redis');
 const { startWhatsApp, closeWhatsApp } = require('./services/whatsapp.service');
 const { startWorker, stopWorker } = require('./queues/message.worker');
 const { closeQueue } = require('./queues/message.queue');
+const { startMediaCleanup } = require('./services/media.service');
 
 const PORT = process.env.PORT || 3000;
+const SHUTDOWN_TIMEOUT_MS = 15000;
 
 async function start() {
   try {
@@ -30,6 +32,7 @@ async function start() {
 
     // 3. Start BullMQ Worker
     startWorker();
+    startMediaCleanup(); // temporary WhatsApp photos (uploaded to the website on registration)
 
     // 4. Start WhatsApp (Baileys)
     await startWhatsApp();
@@ -51,8 +54,19 @@ async function start() {
 
 // ── Graceful Shutdown ──
 
-async function shutdown(signal) {
+let isShuttingDown = false;
+
+async function shutdown(signal, exitCode = 0) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   logger.info(`\n${signal} received. Shutting down gracefully...`);
+
+  // Never hang forever (e.g. a stuck job) — PM2 must be able to restart us.
+  // Keep below kill_timeout in ecosystem.config.js.
+  setTimeout(() => {
+    logger.error('Graceful shutdown timed out, forcing exit');
+    process.exit(exitCode || 1);
+  }, SHUTDOWN_TIMEOUT_MS).unref();
 
   try {
     // Stop accepting new messages
@@ -67,7 +81,7 @@ async function shutdown(signal) {
     await sequelize.close();
 
     logger.info('✅ All connections closed. Goodbye!');
-    process.exit(0);
+    process.exit(exitCode);
   } catch (err) {
     logger.error({ err }, 'Error during shutdown');
     process.exit(1);
@@ -77,6 +91,11 @@ async function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
+// PM2 on Windows cannot deliver SIGINT; with `shutdown_with_message: true` it sends this IPC message instead
+process.on('message', (msg) => {
+  if (msg === 'shutdown') shutdown('PM2_SHUTDOWN');
+});
+
 // Handle unhandled errors
 process.on('unhandledRejection', (reason) => {
   logger.error({ reason }, 'Unhandled Promise Rejection');
@@ -84,7 +103,8 @@ process.on('unhandledRejection', (reason) => {
 
 process.on('uncaughtException', (err) => {
   logger.error({ err }, 'Uncaught Exception');
-  shutdown('UNCAUGHT_EXCEPTION');
+  // Non-zero exit so PM2 records it as a crash (and restarts with backoff)
+  shutdown('UNCAUGHT_EXCEPTION', 1);
 });
 
 // Start the application
