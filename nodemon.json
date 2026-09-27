@@ -1,0 +1,12 @@
+{
+  "watch": ["src/"],
+  "ext": "js,json",
+  "ignore": [
+    "auth_state/**",
+    "baileys_auth/**",
+    "node_modules/**",
+    ".git/**",
+    "*.log"
+  ],
+  "delay": 1000
+}
