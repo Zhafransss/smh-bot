@@ -121,6 +121,24 @@ npm run pm2:start           # menjalankan smh-redis + smh-bot
 | PATCH | `/api/tickets/:id/assign` | API Key | Penugasan teknisi SMH |
 | PATCH | `/api/tickets/:id/priority` | API Key | Update tingkat prioritas tiket |
 
+## Halaman QR Code & Koneksi WhatsApp
+
+Buka `http://<host>:<PORT>/whatsapp` di browser lalu masukkan `API_KEY`. Halaman menampilkan:
+
+- **QR code** (persis string yang dikeluarkan Baileys, berganti otomatis) bila sesi belum terhubung / `auth_state` hilang,
+- **Terhubung** beserta nomor akun bila sudah login, plus tombol **Logout WhatsApp**,
+- tombol **Sambungkan ulang** bila koneksi dihentikan WhatsApp (403 / sesi diambil alih 440).
+
+Logout (dari halaman ini maupun dari HP lewat *Perangkat tertaut*) menghapus folder `auth_state/` lalu otomatis meminta QR baru — tidak perlu restart bot.
+
+| Method | Endpoint | Auth | Keterangan |
+|--------|----------|------|------------|
+| GET | `/api/whatsapp/status` | API Key | `status` (`connected`, `waiting_qr`, `connecting`, `disconnected`, `blocked`, `resetting`), `qr` (string Baileys), `qrImage` (PNG data URL), `user` |
+| POST | `/api/whatsapp/logout` | API Key | Unlink perangkat, hapus sesi, mulai pairing baru |
+| POST | `/api/whatsapp/connect` | API Key | Coba sambung ulang saat status `blocked` |
+
+> QR code memberi kendali penuh atas akun WhatsApp bot — jangan membuka port ini ke publik tanpa HTTPS / pembatasan akses, dan gunakan `API_KEY` yang kuat.
+
 ## Kategori Layanan Kendaraan Listrik (SMH)
 
 1. **Kendala Baterai & Charger** (High)

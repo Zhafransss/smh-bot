@@ -8,6 +8,8 @@ const {
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode-terminal');
 const path = require('path');
+const fs = require('fs/promises');
+const QRCode = require('qrcode');
 const logger = require('../utils/logger');
 const alertService = require('./alert.service');
 const { normalizePhone } = require('../utils/formatter');
@@ -24,25 +26,55 @@ let reconnectTimer = null;
 let isShuttingDown = false;
 let outageAlertSent = false;
 
+// Pairing state exposed to the QR page (routes/whatsapp.routes.js)
+let currentQr = null; // latest raw QR string emitted by Baileys — null once paired / closed
+let currentQrUpdatedAt = null;
+let terminalReason = null; // set when retrying cannot help (403 / 440) — needs manual "connect"
+let resetting = false; // logout / session wipe in progress — socket events are ignored meanwhile
+
+// Cache so polling clients do not re-render the same QR string into an image every time
+let qrImageCache = { qr: null, dataUrl: null };
+
 // The bot must run 24/7: it NEVER gives up reconnecting. After this many consecutive
 // failures the IT team is alerted once per outage, while retries continue in the background.
 const ALERT_AFTER_ATTEMPTS = 5;
 const RECONNECT_DELAYS = [2000, 5000, 10000, 30000, 60000]; // Backoff; the last value repeats indefinitely
+const QR_REFRESH_DELAY_MS = 1000; // unscanned QR expired → request a fresh one right away
 
-// Disconnects that retrying cannot fix — reconnecting would loop forever or fight another session
+// Disconnects that retrying cannot fix — reconnecting would loop forever or fight another session.
+// (loggedOut is handled separately: the stale session is wiped and a fresh QR is requested.)
 const TERMINAL_DISCONNECTS = {
-  [DisconnectReason.loggedOut]: 'Sesi WhatsApp logout. Perlu scan QR code ulang.',
   [DisconnectReason.forbidden]: 'Nomor WhatsApp bot ditolak/diblokir oleh WhatsApp (403).',
   [DisconnectReason.connectionReplaced]:
     'Sesi WhatsApp diambil alih oleh koneksi lain (kemungkinan bot berjalan ganda atau WhatsApp Web dibuka di tempat lain).',
 };
 
+function getSessionDir() {
+  return path.resolve(process.env.WA_SESSION_PATH || './auth_state');
+}
+
 /**
  * Schedule a reconnect with backoff. Retries forever until connected or shutting down.
  * @param {string} reason
+ * @param {{ fastRefresh?: boolean }} [options] - fastRefresh: the QR simply expired unscanned, so
+ *   it is not an outage — retry quickly without counting towards the backoff / outage alert
  */
-function scheduleReconnect(reason) {
+function scheduleReconnect(reason, { fastRefresh = false } = {}) {
   if (isShuttingDown || reconnectTimer) return;
+
+  if (fastRefresh) {
+    logger.info({ reason }, 'Pairing stage ended (QR expired or scanned), reconnecting quickly...');
+    reconnectTimer = setTimeout(async () => {
+      reconnectTimer = null;
+      try {
+        await startWhatsApp();
+      } catch (err) {
+        logger.error({ err }, 'Failed to restart WhatsApp socket');
+        scheduleReconnect('start_failed');
+      }
+    }, QR_REFRESH_DELAY_MS);
+    return;
+  }
 
   reconnectAttempts++;
   const delay = RECONNECT_DELAYS[Math.min(reconnectAttempts - 1, RECONNECT_DELAYS.length - 1)];
@@ -72,13 +104,12 @@ function scheduleReconnect(reason) {
  * Initialize WhatsApp connection using Baileys
  */
 async function startWhatsApp() {
-  const sessionPath = process.env.WA_SESSION_PATH || './auth_state';
-  const absolutePath = path.resolve(sessionPath);
-
-  const { state, saveCreds } = await useMultiFileAuthState(absolutePath);
+  const { state, saveCreds } = await useMultiFileAuthState(getSessionDir());
   const { version } = await fetchLatestBaileysVersion();
 
   connectionState = 'connecting';
+  currentQr = null;
+  currentQrUpdatedAt = null;
   sock = makeWASocket({
     version,
     auth: state,
@@ -93,12 +124,18 @@ async function startWhatsApp() {
 
   // ── Connection Events ──
 
+  // Events of a replaced / discarded socket must never touch the current state
+  const thisSock = sock;
+
   sock.ev.on('connection.update', async (update) => {
+    if (thisSock !== sock || resetting) return;
     const { connection, lastDisconnect, qr } = update;
 
-    // QR Code display
+    // QR Code: keep the exact string Baileys emitted so the web page shows the very same code
     if (qr) {
-      logger.info('📱 Scan QR Code berikut dengan WhatsApp Anda:');
+      currentQr = qr;
+      currentQrUpdatedAt = Date.now();
+      logger.info('📱 Scan QR Code berikut dengan WhatsApp Anda (atau buka halaman /whatsapp):');
       qrcode.generate(qr, { small: true });
     }
 
@@ -108,25 +145,49 @@ async function startWhatsApp() {
 
     if (connection === 'close') {
       connectionState = 'disconnected';
+      const hadQr = currentQr !== null; // closed while still waiting for a scan
+      currentQr = null;
+      currentQrUpdatedAt = null;
       if (isShuttingDown) return; // Closed by closeWhatsApp() — do not reconnect
 
       const boom = lastDisconnect?.error;
       const statusCode = boom instanceof Boom ? boom.output?.statusCode : null;
-      const terminalReason = TERMINAL_DISCONNECTS[statusCode];
 
-      logger.warn({ statusCode, willReconnect: !terminalReason }, 'WhatsApp connection closed');
-
-      if (terminalReason) {
-        logger.error({ statusCode }, `${terminalReason} Manual action required.`);
-        await alertService.sendConnectionAlert(`${terminalReason} (status code: ${statusCode})`);
+      // Logged out (from the phone's "Linked devices" or after the session got invalid):
+      // the saved credentials are dead, so wipe them and ask WhatsApp for a fresh QR.
+      if (statusCode === DisconnectReason.loggedOut) {
+        logger.warn('WhatsApp session logged out, wiping saved session and requesting a new QR');
+        alertService
+          .sendConnectionAlert('Sesi WhatsApp logout. Perlu scan QR code ulang (buka halaman /whatsapp).')
+          .catch(() => {});
+        try {
+          await discardSession();
+          await startWhatsApp();
+        } catch (err) {
+          logger.error({ err }, 'Failed to restart WhatsApp after logout');
+          scheduleReconnect('start_failed');
+        }
         return;
       }
 
-      scheduleReconnect(`status_${statusCode}`);
+      const blockedReason = TERMINAL_DISCONNECTS[statusCode];
+      logger.warn({ statusCode, willReconnect: !blockedReason }, 'WhatsApp connection closed');
+
+      if (blockedReason) {
+        terminalReason = blockedReason;
+        logger.error({ statusCode }, `${blockedReason} Manual action required.`);
+        await alertService.sendConnectionAlert(`${blockedReason} (status code: ${statusCode})`);
+        return;
+      }
+
+      scheduleReconnect(`status_${statusCode}`, { fastRefresh: hadQr });
     }
 
     if (connection === 'open') {
       connectionState = 'open';
+      currentQr = null;
+      currentQrUpdatedAt = null;
+      terminalReason = null;
       if (reconnectAttempts > 0) {
         logger.info({ attempts: reconnectAttempts }, 'WhatsApp connection recovered');
       }
@@ -136,8 +197,10 @@ async function startWhatsApp() {
     }
   });
 
-  // Save credentials on update
-  sock.ev.on('creds.update', saveCreds);
+  // Save credentials on update (never after the session was wiped by logout)
+  sock.ev.on('creds.update', () => {
+    if (thisSock === sock && !resetting) saveCreds();
+  });
 
   // ── Message Events ──
 
@@ -336,6 +399,126 @@ function getConnectionStatus() {
 }
 
 /**
+ * Snapshot of the pairing state for the QR page.
+ * status: 'connected' | 'waiting_qr' | 'connecting' | 'disconnected' | 'blocked' | 'resetting'
+ * @returns {Promise<{ status: string, qr: string|null, qrImage: string|null, qrUpdatedAt: number|null,
+ *   user: { number: string, name: string|null }|null, reason: string|null }>}
+ */
+async function getSessionInfo() {
+  let status;
+  if (resetting) status = 'resetting';
+  else if (connectionState === 'open') status = 'connected';
+  else if (terminalReason) status = 'blocked';
+  else if (currentQr) status = 'waiting_qr';
+  else if (connectionState === 'connecting') status = 'connecting';
+  else status = 'disconnected';
+
+  const qr = status === 'waiting_qr' ? currentQr : null;
+  let qrImage = null;
+  if (qr) {
+    if (qrImageCache.qr !== qr) {
+      qrImageCache = {
+        qr,
+        // Rendered from the exact string Baileys emitted — nothing is altered or re-encoded
+        dataUrl: await QRCode.toDataURL(qr, { errorCorrectionLevel: 'L', margin: 2, width: 320 }),
+      };
+    }
+    qrImage = qrImageCache.dataUrl;
+  }
+
+  const rawUser = status === 'connected' ? sock?.user : null;
+  return {
+    status,
+    qr,
+    qrImage,
+    qrUpdatedAt: qr ? currentQrUpdatedAt : null,
+    user: rawUser ? { number: normalizePhone(rawUser.id || ''), name: rawUser.name || null } : null,
+    reason: status === 'blocked' ? terminalReason : null,
+  };
+}
+
+/**
+ * Drop the current socket (without reconnecting) and delete the saved credentials,
+ * so the next startWhatsApp() begins unpaired and emits a QR code.
+ */
+async function discardSession() {
+  const old = sock;
+  sock = null;
+  connectionState = 'disconnected';
+  currentQr = null;
+  currentQrUpdatedAt = null;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  if (old) {
+    try {
+      for (const event of ['connection.update', 'creds.update', 'messages.upsert']) {
+        old.ev.removeAllListeners(event);
+      }
+      old.end(undefined);
+    } catch (err) {
+      logger.debug({ err }, 'Notice while closing old WhatsApp socket');
+    }
+  }
+
+  await fs.rm(getSessionDir(), { recursive: true, force: true });
+}
+
+/**
+ * Log the bot out of WhatsApp (unlinks the device), wipe the saved session and start a new
+ * pairing so a fresh QR code appears. Works even if the socket is not connected.
+ */
+async function logoutWhatsApp() {
+  if (resetting) throw new Error('Proses logout sedang berjalan');
+  resetting = true;
+
+  try {
+    if (sock && connectionState === 'open') {
+      try {
+        await sock.logout();
+      } catch (err) {
+        // e.g. connection dropped meanwhile — the local session is wiped below anyway
+        logger.warn({ err }, 'WhatsApp logout request failed, wiping local session anyway');
+      }
+    }
+    await discardSession();
+    reconnectAttempts = 0;
+    outageAlertSent = false;
+    terminalReason = null;
+    logger.info('WhatsApp logged out, session wiped');
+  } finally {
+    resetting = false;
+  }
+
+  try {
+    await startWhatsApp(); // unpaired → emits a fresh QR
+  } catch (err) {
+    logger.error({ err }, 'Failed to start WhatsApp after logout');
+    scheduleReconnect('start_failed');
+  }
+}
+
+/**
+ * Manually (re)start the connection — for the "blocked" state, where automatic retries stopped.
+ * No-op while a socket is already connecting / connected.
+ * @returns {Promise<boolean>} true when a new connection attempt was started
+ */
+async function connectWhatsApp() {
+  if (resetting || (sock && connectionState !== 'disconnected')) return false;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  terminalReason = null;
+  reconnectAttempts = 0;
+  outageAlertSent = false;
+  await startWhatsApp();
+  return true;
+}
+
+/**
  * Close WhatsApp connection gracefully
  */
 async function closeWhatsApp() {
@@ -357,5 +540,8 @@ module.exports = {
   sendPresence,
   markAsRead,
   getConnectionStatus,
+  getSessionInfo,
+  logoutWhatsApp,
+  connectWhatsApp,
   closeWhatsApp,
 };

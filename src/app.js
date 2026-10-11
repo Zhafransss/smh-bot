@@ -1,6 +1,8 @@
 const express = require('express');
 const ticketRoutes = require('./routes/ticket.routes');
 const healthRoutes = require('./routes/health.routes');
+const whatsappRoutes = require('./routes/whatsapp.routes');
+const path = require('path');
 const errorHandler = require('./middlewares/error.middleware');
 const { apiKeyAuth } = require('./middlewares/auth.middleware');
 
@@ -35,6 +37,13 @@ app.use((req, res, next) => {
 // ── Routes ──
 app.use('/api/tickets', apiKeyAuth, ticketRoutes);
 app.use('/api/health', healthRoutes);
+app.use('/api/whatsapp', apiKeyAuth, whatsappRoutes);
+
+// QR / status page — static HTML without secrets; it asks for the API key and calls /api/whatsapp/*
+app.get('/whatsapp', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.sendFile(path.join(__dirname, 'public', 'whatsapp.html'));
+});
 
 // ── Root ──
 app.get('/', (req, res) => {

@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Koneksi WhatsApp — SMH Bot</title>
+  <style>
+    :root {
+      --bg: #f4f6f8; --card: #ffffff; --text: #1b2430; --muted: #5d6b7c; --border: #dde3ea;
+      --ok: #1a7f4b; --ok-bg: #e3f5ec; --warn: #9a6200; --warn-bg: #fff3d6;
+      --err: #b42318; --err-bg: #fde8e6; --accent: #0b6bcb; --accent-text: #ffffff;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #11161c; --card: #1a212a; --text: #e8edf3; --muted: #9aa8b8; --border: #2c3744;
+        --ok: #5fd39a; --ok-bg: #16352a; --warn: #f0be58; --warn-bg: #3a2f14;
+        --err: #ff8f84; --err-bg: #3d1d1a; --accent: #4a9bf0; --accent-text: #0b1118;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      padding: 16px; background: var(--bg); color: var(--text);
+      font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    main {
+      width: 100%; max-width: 420px; background: var(--card); border: 1px solid var(--border);
+      border-radius: 14px; padding: 24px; text-align: center;
+    }
+    h1 { font-size: 1.2rem; margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: .9rem; margin: 0 0 18px; }
+    .badge {
+      display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: .85rem; font-weight: 600;
+      background: var(--warn-bg); color: var(--warn); margin-bottom: 16px;
+    }
+    .badge.ok { background: var(--ok-bg); color: var(--ok); }
+    .badge.err { background: var(--err-bg); color: var(--err); }
+    #qr-box { display: none; }
+    #qr-img {
+      display: block; width: 100%; max-width: 320px; aspect-ratio: 1; margin: 0 auto 12px;
+      background: #fff; border-radius: 8px; image-rendering: pixelated;
+    }
+    ol { text-align: left; color: var(--muted); font-size: .9rem; padding-left: 20px; margin: 12px 0 0; }
+    #connected-box { display: none; }
+    .check { font-size: 3rem; line-height: 1; color: var(--ok); margin-bottom: 8px; }
+    .acct { font-weight: 600; font-size: 1.1rem; }
+    .msg { color: var(--muted); font-size: .9rem; margin: 8px 0 0; }
+    button {
+      font: inherit; font-weight: 600; cursor: pointer; border-radius: 8px; padding: 10px 18px;
+      border: 1px solid var(--border); background: transparent; color: var(--text); margin-top: 18px;
+    }
+    button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+    button.danger { color: var(--err); border-color: var(--err); }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    #key-form { display: none; }
+    input {
+      font: inherit; width: 100%; padding: 10px 12px; border-radius: 8px; margin-top: 8px;
+      border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    }
+    #notice { min-height: 1.4em; margin-top: 14px; font-size: .88rem; color: var(--muted); }
+    #notice.err { color: var(--err); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Koneksi WhatsApp</h1>
+  <p class="sub">SMH Support Bot</p>
+
+  <div id="badge" class="badge">Memuat…</div>
+
+  <form id="key-form">
+    <p class="msg">Masukkan API key untuk mengelola koneksi WhatsApp.</p>
+    <input id="key-input" type="password" placeholder="API key" autocomplete="off" required>
+    <button class="primary" type="submit">Masuk</button>
+  </form>
+
+  <section id="qr-box">
+    <img id="qr-img" alt="QR Code WhatsApp">
+    <p class="msg" id="qr-age"></p>
+    <ol>
+      <li>Buka WhatsApp di ponsel bot.</li>
+      <li>Pilih <b>Perangkat tertaut</b> → <b>Tautkan perangkat</b>.</li>
+      <li>Arahkan kamera ke QR code ini. QR berganti otomatis.</li>
+    </ol>
+  </section>
+
+  <section id="connected-box">
+    <div class="check" aria-hidden="true">✓</div>
+    <div class="acct" id="acct"></div>
+    <p class="msg">Bot sudah terhubung dan siap menerima pesan.</p>
+    <button class="danger" id="logout-btn" type="button">Logout WhatsApp</button>
+  </section>
+
+  <section id="info-box" style="display:none">
+    <p class="msg" id="info-text"></p>
+    <button class="primary" id="connect-btn" type="button" style="display:none">Sambungkan ulang</button>
+  </section>
+
+  <div id="notice" role="status" aria-live="polite"></div>
+</main>
+
+<script>
+(() => {
+  const POLL_MS = 2000;
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    badge: $('badge'), keyForm: $('key-form'), keyInput: $('key-input'),
+    qrBox: $('qr-box'), qrImg: $('qr-img'), qrAge: $('qr-age'),
+    connectedBox: $('connected-box'), acct: $('acct'), logoutBtn: $('logout-btn'),
+    infoBox: $('info-box'), infoText: $('info-text'), connectBtn: $('connect-btn'),
+    notice: $('notice'),
+  };
+
+  let apiKey = null;
+  let timer = null;
+  let busy = false;       // logout / connect request in flight
+  let lastQr = null;      // raw QR string currently drawn
+  let qrUpdatedAt = null;
+
+  try { apiKey = sessionStorage.getItem('smh_api_key'); } catch { /* storage unavailable */ }
+
+  const LABELS = {
+    connected: ['Terhubung', 'ok'],
+    waiting_qr: ['Menunggu scan QR', ''],
+    connecting: ['Menyambungkan…', ''],
+    disconnected: ['Terputus — mencoba menyambung', 'err'],
+    blocked: ['Perlu tindakan', 'err'],
+    resetting: ['Memproses logout…', ''],
+  };
+
+  function setNotice(text, isError) {
+    els.notice.textContent = text || '';
+    els.notice.className = isError ? 'err' : '';
+  }
+
+  function show(section) {
+    els.keyForm.style.display = section === 'key' ? 'block' : 'none';
+    els.qrBox.style.display = section === 'qr' ? 'block' : 'none';
+    els.connectedBox.style.display = section === 'connected' ? 'block' : 'none';
+    els.infoBox.style.display = section === 'info' ? 'block' : 'none';
+  }
+
+  function api(path, method = 'GET') {
+    return fetch(path, { method, headers: { 'x-api-key': apiKey || '' }, cache: 'no-store' });
+  }
+
+  function askForKey(message) {
+    apiKey = null;
+    try { sessionStorage.removeItem('smh_api_key'); } catch { /* ignore */ }
+    stopPolling();
+    els.badge.textContent = 'Perlu login';
+    els.badge.className = 'badge';
+    show('key');
+    setNotice(message, !!message);
+  }
+
+  function render(data) {
+    const [label, tone] = LABELS[data.status] || [data.status, ''];
+    els.badge.textContent = label;
+    els.badge.className = 'badge' + (tone ? ' ' + tone : '');
+
+    if (data.status === 'waiting_qr' && data.qrImage) {
+      show('qr');
+      // Redraw only when Baileys issued a new QR string
+      if (data.qr !== lastQr) {
+        lastQr = data.qr;
+        els.qrImg.src = data.qrImage;
+      }
+      qrUpdatedAt = data.qrUpdatedAt;
+      updateQrAge();
+      return;
+    }
+
+    lastQr = null;
+    qrUpdatedAt = null;
+
+    if (data.status === 'connected') {
+      show('connected');
+      const u = data.user;
+      els.acct.textContent = u ? (u.name ? u.name + ' · ' : '') + '+' + u.number : 'WhatsApp terhubung';
+      return;
+    }
+
+    show('info');
+    els.connectBtn.style.display = data.status === 'blocked' ? 'inline-block' : 'none';
+    els.infoText.textContent = {
+      blocked: data.reason || 'Koneksi dihentikan.',
+      resetting: 'Sedang logout dan menyiapkan QR baru…',
+      connecting: 'Menyiapkan koneksi ke WhatsApp…',
+      disconnected: 'Koneksi terputus. Bot mencoba menyambung kembali secara otomatis.',
+    }[data.status] || '';
+  }
+
+  function updateQrAge() {
+    if (!qrUpdatedAt) { els.qrAge.textContent = ''; return; }
+    const s = Math.max(0, Math.round((Date.now() - qrUpdatedAt) / 1000));
+    els.qrAge.textContent = 'QR dibuat ' + s + ' detik lalu';
+  }
+
+  async function poll() {
+    if (busy || !apiKey) return;
+    try {
+      const res = await api('/api/whatsapp/status');
+      if (res.status === 401) return askForKey('API key tidak valid.');
+      const body = await res.json();
+      if (!res.ok || !body.success) throw new Error(body.message || 'HTTP ' + res.status);
+      setNotice('');
+      render(body.data);
+    } catch (err) {
+      setNotice('Tidak dapat menghubungi server: ' + err.message, true);
+    }
+  }
+
+  function startPolling() {
+    stopPolling();
+    poll();
+    timer = setInterval(() => { if (!document.hidden) poll(); }, POLL_MS);
+  }
+  function stopPolling() { if (timer) { clearInterval(timer); timer = null; } }
+
+  async function action(path, okText) {
+    busy = true;
+    els.logoutBtn.disabled = els.connectBtn.disabled = true;
+    try {
+      const res = await api(path, 'POST');
+      if (res.status === 401) return askForKey('API key tidak valid.');
+      const body = await res.json();
+      if (!res.ok || !body.success) throw new Error(body.message || 'HTTP ' + res.status);
+      setNotice(okText);
+    } catch (err) {
+      setNotice('Gagal: ' + err.message, true);
+    } finally {
+      busy = false;
+      els.logoutBtn.disabled = els.connectBtn.disabled = false;
+      if (apiKey) poll();
+    }
+  }
+
+  els.keyForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    apiKey = els.keyInput.value.trim();
+    els.keyInput.value = '';
+    try { sessionStorage.setItem('smh_api_key', apiKey); } catch { /* ignore */ }
+    show('info');
+    els.infoText.textContent = '';
+    startPolling();
+  });
+
+  els.logoutBtn.addEventListener('click', () => {
+    if (confirm('Logout WhatsApp? Bot akan berhenti membalas sampai QR baru dipindai.')) {
+      action('/api/whatsapp/logout', 'Logout berhasil. Silakan scan QR baru.');
+    }
+  });
+  els.connectBtn.addEventListener('click', () => action('/api/whatsapp/connect', 'Mencoba menyambung…'));
+
+  setInterval(updateQrAge, 1000);
+
+  if (apiKey) { show('info'); startPolling(); } else { askForKey(''); }
+})();
+</script>
+</body>
+</html>
