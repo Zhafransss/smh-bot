@@ -187,6 +187,57 @@ async function clearRegistration(phoneNumber) {
   }
 }
 
+const MAX_DESKRIPSI_LENGTH = 300;
+
+const GREETING_PREFIX = /^\s*(?:(?:halo|hallo|hai|hi|hello|assalamu'?alaikum|assalamualaikum|permisi|selamat\s+(?:pagi|siang|sore|malam)|pagi|siang|sore|malam|kak|min|admin|mas|mbak|bang|pak|bu|pak\/bu|bapak|ibu|om|tolong|mohon|maaf|numpang\s+tanya|mau\s+tanya|boleh\s+tanya)\b[\s,.!:\/-]*)+/i;
+const NON_COMPLAINT_SENTENCE = new RegExp(
+  [
+    '\\?',
+    '^(?:apakah|apa|bisakah|bisa|boleh|berapa|bagaimana|gimana|kapan|dimana|di mana|ada\\s+(?:layanan|jasa)|tersedia|mau|ingin|pengen|minta|terima kasih|makasih|trims|thanks)\\b',
+    '\\b(?:saya|aku|kami)\\s+(?:tinggal|berada|ada|domisili)\\b',
+    '^(?:tinggal|alamat|lokasi|domisili|daerah|di daerah)\\b',
+    '\\b(?:jadwal|hari ini|besok|lusa|jam\\s+\\d)',
+    '\\b(?:biaya|harga|tarif|ongkos)\\b',
+    '\\b(?:servis|service)\\s+ke\\s+rumah\\b',
+    '\\bhome\\s*service\\b',
+  ].join('|'),
+  'i'
+);
+
+/**
+ * Short "deskripsi kerusakan": the AI summary of the complaint. When that is unavailable, the
+ * customer's own words reduced to the problem itself — greetings, questions, location, schedule
+ * and price talk are dropped — flattened to one line and truncated.
+ * @param {object} regData
+ * @returns {string}
+ */
+function buildShortDescription(regData) {
+  const oneLine = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+  const vehicleLabel = regData.vehicle === 'motor' ? 'Motor listrik' : regData.vehicle === 'sepeda' ? 'Sepeda listrik' : '';
+
+  let text = oneLine(regData.aiSummary);
+  if (!text) {
+    const raw = String(regData.complaint || regData.kendala || '');
+    const sentences = raw
+      .split(/(?<=[.!?])\s+|\n+/)
+      .map((sentence) => oneLine(sentence.replace(GREETING_PREFIX, '')).replace(/^[,.\s]+/, ''))
+      .filter((sentence) => sentence && !NON_COMPLAINT_SENTENCE.test(sentence));
+
+    // Everything looked like chatter: keep the customer's words rather than send nothing
+    text = oneLine((sentences.length ? sentences : [raw.replace(GREETING_PREFIX, '')]).join(' ')).replace(/^saya\s+(?:punya|ada)\s+/i, '');
+    if (vehicleLabel && !/sepeda|motor|selis|molis/i.test(text)) text = `${vehicleLabel}: ${text}`;
+  }
+  if (text.length > MAX_DESKRIPSI_LENGTH) {
+    // Prefer cutting at the end of a sentence; otherwise at a word boundary
+    const head = text.slice(0, MAX_DESKRIPSI_LENGTH);
+    const lastSentenceEnd = Math.max(head.lastIndexOf('. '), head.lastIndexOf('! '));
+    text = lastSentenceEnd >= MAX_DESKRIPSI_LENGTH / 2
+      ? head.slice(0, lastSentenceEnd + 1)
+      : `${head.slice(0, head.lastIndexOf(' ')).trimEnd()}…`;
+  }
+  return text || '-';
+}
+
 /**
  * Build the form fields for POST /api/home-service (website PublicServiceController@storeHomeService).
  * The photo file (`gambar`) is attached separately by website.service.
@@ -194,15 +245,8 @@ async function clearRegistration(phoneNumber) {
  * @returns {Record<string, string>}
  */
 function buildHomeServicePayload(regData) {
-  // Customer's own words first; the rest are internal notes for the admin
-  const deskripsiParts = [regData.complaint || regData.kendala];
-  if (regData.vehicle) deskripsiParts.push(`Jenis kendaraan: ${regData.vehicle === 'motor' ? 'Motor listrik' : 'Sepeda listrik'}`);
-  if (regData.kendaraan) deskripsiParts.push(`Kendaraan: ${regData.kendaraan}`);
-  if (regData.aiSummary) deskripsiParts.push(`Ringkasan AI (internal): ${regData.aiSummary}`);
-  if (regData.diagnosis?.isDefault) deskripsiParts.push('Catatan: jenis kerusakan belum spesifik, perlu pengecekan teknisi.');
-  if (regData.diagnosis?.geminiFailed) deskripsiParts.push('Catatan: analisis otomatis gagal, estimasi perlu dikonfirmasi admin.');
-  if (regData.jadwal?.raw) deskripsiParts.push(`Permintaan jadwal konsumen: "${regData.jadwal.raw}"`);
-  deskripsiParts.push('(Didaftarkan via chatbot WhatsApp)');
+  // Short complaint summary only (AI summary of what the customer reported); no internal notes
+  const deskripsi = buildShortDescription(regData);
 
   return {
     namaLengkap: regData.nama,
@@ -211,7 +255,7 @@ function buildHomeServicePayload(regData) {
     latitude: String(regData.location.latitude),
     longitude: String(regData.location.longitude),
     idJenisKerusakan: String(regData.diagnosis.jenis.id),
-    deskripsi: deskripsiParts.join('\n'),
+    deskripsi,
     tanggal: regData.jadwal.tanggal,
     waktuMulai: regData.jadwal.waktuMulai,
     waktuSelesai: regData.jadwal.waktuSelesai,
