@@ -2,12 +2,12 @@ const { normalizeText } = require('../utils/textNormalizer');
 
 const OPERATIONAL_DATA = {
   store1: {
-    name: 'Toko 1 (Pusat)',
+    name: 'Bengkel (Pusat)',
     city: 'Purwokerto',
     address: 'Jl. Jend Sudirman No. 32, Kebontebu Berkoh, Purwokerto Selatan, Jawa Tengah.',
   },
   store2: {
-    name: 'Toko 2 (Cadangan)',
+    name: 'Bengkel 2 (Cadangan)',
     city: 'Cirebon',
     address: 'Jl. Sultan Agung Sumber Sumber, Cirebon, Jawa Barat.',
   },
@@ -264,10 +264,10 @@ function matchOperationalInfo(rawMessage) {
       layer: 'LAYER_B',
       subIntent: 'STORE_LOCATION',
       reply:
-        `Halo kak! Selis Molis Hoki memiliki 2 lokasi toko:\n\n` +
-        `📍 *Toko 1 (Pusat - Purwokerto):*\n` +
+        `Halo kak! Selis Molis Hoki memiliki 2 lokasi bengkel:\n\n` +
+        `📍 *Bengkel 1 (Pusat - Purwokerto):*\n` +
         `${OPERATIONAL_DATA.store1.address}\n\n` +
-        `📍 *Toko 2 (Cirebon):*\n` +
+        `📍 *Bengkel 2 (Cirebon):*\n` +
         `${OPERATIONAL_DATA.store2.address}\n\n` +
         `⏰ Jam buka: Senin–Sabtu, 09.00–17.00 WIB (Minggu tutup).\n\n` +
         `Silakan kunjungi bengkel kami atau kabari jika ingin layanan home service ya kak! 😊`,
